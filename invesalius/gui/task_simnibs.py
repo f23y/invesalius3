@@ -820,7 +820,7 @@ class InnerTaskPanel(wx.Panel):
 
         for label in present:
             name, _colour = info[label]
-            mask_name = f"SimNIBS_{name}"
+            mask_name = f"{name}"
 
             binary    = (data == label).astype(np.uint8) * 255
             mask_img  = nib.Nifti1Image(binary, nii.affine, nii.header)
@@ -829,10 +829,9 @@ class InnerTaskPanel(wx.Panel):
                 tmp = fh.name
             try:
                 nib.save(mask_img, tmp)
-                Publisher.sendMessage("Import Nifti mask", filepath=tmp)
+                Publisher.sendMessage("Import Nifti mask", filepath=tmp, mask_name=mask_name)
                 proj = prj.Project()
                 idx  = max(proj.mask_dict.keys())
-                proj.mask_dict[idx].name = mask_name
                 created.append((idx, mask_name))
             except Exception as exc:
                 wx.MessageBox(
