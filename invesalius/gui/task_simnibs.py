@@ -34,25 +34,25 @@ import invesalius.utils as utils
 from invesalius.i18n import tr as _
 from invesalius.pubsub import pub as Publisher
 
-_KEY_M2M_DIR     = "simnibs_last_m2m_dir"
-_KEY_OUTPUT_DIR  = "simnibs_last_output_dir"
-_KEY_COIL_FILE   = "simnibs_last_coil_file"
-_KEY_T1_FILE     = "simnibs_last_t1_file"
-_KEY_T2_FILE     = "simnibs_last_t2_file"
+_KEY_M2M_DIR = "simnibs_last_m2m_dir"
+_KEY_OUTPUT_DIR = "simnibs_last_output_dir"
+_KEY_COIL_FILE = "simnibs_last_coil_file"
+_KEY_T1_FILE = "simnibs_last_t1_file"
+_KEY_T2_FILE = "simnibs_last_t2_file"
 _KEY_SIMNIBS_EXE = "simnibs_executable_path"
 
 # Pubsub topic strings
-TOPIC_LOAD_SURFACES   = "Load SimNIBS surfaces"
-TOPIC_LOAD_RESULT     = "Load SimNIBS result"
+TOPIC_LOAD_SURFACES = "Load SimNIBS surfaces"
+TOPIC_LOAD_RESULT = "Load SimNIBS result"
 TOPIC_REMOVE_SURFACES = "Remove SimNIBS surfaces"
-TOPIC_SET_VISIBILITY  = "Set SimNIBS surface visibility"
-TOPIC_SET_OPACITY     = "Set SimNIBS surface opacity"
-TOPIC_SET_COLORMAP    = "Set SimNIBS colormap"
-TOPIC_SET_THRESHOLD   = "Set SimNIBS threshold"
+TOPIC_SET_VISIBILITY = "Set SimNIBS surface visibility"
+TOPIC_SET_OPACITY = "Set SimNIBS surface opacity"
+TOPIC_SET_COLORMAP = "Set SimNIBS colormap"
+TOPIC_SET_THRESHOLD = "Set SimNIBS threshold"
 TOPIC_SURFACES_LOADED = "SimNIBS surfaces loaded"
-TOPIC_EFIELD_LOADED   = "SimNIBS efield loaded"
-TOPIC_PROGRESS        = "SimNIBS progress"
-TOPIC_ERROR           = "SimNIBS error"
+TOPIC_EFIELD_LOADED = "SimNIBS efield loaded"
+TOPIC_PROGRESS = "SimNIBS progress"
+TOPIC_ERROR = "SimNIBS error"
 
 
 # Find SimNIBS
@@ -84,6 +84,7 @@ def _simnibs_site_packages() -> str | None:
     if not charm_exe:
         return None
     import glob
+
     simnibs_root = os.path.dirname(os.path.dirname(charm_exe))
     candidates = glob.glob(
         os.path.join(simnibs_root, "simnibs_env", "lib", "python*", "site-packages")
@@ -115,8 +116,7 @@ def _read_lut() -> dict:
     sp = _simnibs_site_packages()
     if not sp:
         return {}
-    lut_path = os.path.join(sp, "simnibs", "resources",
-                            "final_tissues_FreeSurferColorLUT.txt")
+    lut_path = os.path.join(sp, "simnibs", "resources", "final_tissues_FreeSurferColorLUT.txt")
     if not os.path.isfile(lut_path):
         return {}
     result: dict = {}
@@ -130,7 +130,7 @@ def _read_lut() -> dict:
                 continue
             try:
                 label = int(parts[0])
-                name  = parts[1]
+                name = parts[1]
                 r, g, b = int(parts[2]), int(parts[3]), int(parts[4])
                 result[label] = (name, (r, g, b))
             except ValueError:
@@ -233,12 +233,19 @@ class CharmRunner:
     """
 
     def __init__(self):
-        self._proc:   subprocess.Popen | None = None
+        self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
 
-    def start(self, subject: str, t1: str, t2: str | None,
-              outdir: str, forcerun: bool,
-              progress_cb, done_cb) -> None:
+    def start(
+        self,
+        subject: str,
+        t1: str,
+        t2: str | None,
+        outdir: str,
+        forcerun: bool,
+        progress_cb,
+        done_cb,
+    ) -> None:
         self._thread = threading.Thread(
             target=self._run,
             args=(subject, t1, t2, outdir, forcerun, progress_cb, done_cb),
@@ -249,9 +256,7 @@ class CharmRunner:
     def cancel(self) -> None:
         if self._proc and self._proc.poll() is None:
             if sys.platform == "win32":
-                subprocess.call(
-                    ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)]
-                )
+                subprocess.call(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)])
             else:
                 try:
                     os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
@@ -262,9 +267,12 @@ class CharmRunner:
         charm_exe = _find_charm()
         if not charm_exe:
             wx.CallAfter(
-                done_cb, False,
-                _("charm executable not found.\n"
-                  "Install SimNIBS and ensure it is on PATH or a standard location."),
+                done_cb,
+                False,
+                _(
+                    "charm executable not found.\n"
+                    "Install SimNIBS and ensure it is on PATH or a standard location."
+                ),
                 None,
             )
             return
@@ -310,15 +318,16 @@ class CharmRunner:
             return
 
         if rc != 0:
-            wx.CallAfter(done_cb, False,
-                         _("charm exited with code {}").format(rc), None)
+            wx.CallAfter(done_cb, False, _("charm exited with code {}").format(rc), None)
             return
 
         m2m_dir = os.path.join(outdir, f"m2m_{subject}")
         if not os.path.isdir(m2m_dir):
             wx.CallAfter(
-                done_cb, False,
-                _("Expected output folder not found:\n{}").format(m2m_dir), None,
+                done_cb,
+                False,
+                _("Expected output folder not found:\n{}").format(m2m_dir),
+                None,
             )
             return
 
@@ -355,8 +364,8 @@ class InnerTaskPanel(wx.Panel):
 
         self.SetBackgroundColour(wx.SystemSettings.GetColour(wx.SYS_COLOUR_MENUBAR))
 
-        self.session      = ses.Session()
-        self._m2m_path    = None
+        self.session = ses.Session()
+        self._m2m_path = None
         self._pose_locked = False
 
         self._subscribe()
@@ -365,103 +374,117 @@ class InnerTaskPanel(wx.Panel):
 
     def _subscribe(self):
         Publisher.subscribe(self._on_surfaces_loaded, TOPIC_SURFACES_LOADED)
-        Publisher.subscribe(self._on_efield_loaded,   TOPIC_EFIELD_LOADED)
-        Publisher.subscribe(self._on_progress,        TOPIC_PROGRESS)
-        Publisher.subscribe(self._on_error,           TOPIC_ERROR)
+        Publisher.subscribe(self._on_efield_loaded, TOPIC_EFIELD_LOADED)
+        Publisher.subscribe(self._on_progress, TOPIC_PROGRESS)
+        Publisher.subscribe(self._on_error, TOPIC_ERROR)
 
     def _build_ui(self):
         # HEAD MODEL
-        box_hm   = wx.StaticBox(self, -1, _("Head Model (charm)"))
-        sz_hm    = wx.StaticBoxSizer(box_hm, wx.VERTICAL)
+        box_hm = wx.StaticBox(self, -1, _("Head Model (charm)"))
+        sz_hm = wx.StaticBoxSizer(box_hm, wx.VERTICAL)
 
         self.txt_subject = wx.TextCtrl(self, -1, "")
-        self.txt_t1      = wx.TextCtrl(self, -1, "")
-        self.txt_t2      = wx.TextCtrl(self, -1, "")
-        self.txt_hm_out  = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
+        self.txt_t1 = wx.TextCtrl(self, -1, "")
+        self.txt_t2 = wx.TextCtrl(self, -1, "")
+        self.txt_hm_out = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
 
-        btn_t1     = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
-        btn_t2     = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
+        btn_t1 = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
+        btn_t2 = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
         btn_hm_out = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
 
-        btn_t1.Bind(wx.EVT_BUTTON,     self.OnBrowseT1)
-        btn_t2.Bind(wx.EVT_BUTTON,     self.OnBrowseT2)
+        btn_t1.Bind(wx.EVT_BUTTON, self.OnBrowseT1)
+        btn_t2.Bind(wx.EVT_BUTTON, self.OnBrowseT2)
         btn_hm_out.Bind(wx.EVT_BUTTON, self.OnBrowseHMOutput)
 
         g1 = wx.FlexGridSizer(4, 3, 2, 2)
         g1.AddGrowableCol(1)
-        g1.Add(wx.StaticText(self, -1, _("Subject ID:")),  0, wx.ALIGN_CENTER_VERTICAL)
-        g1.Add(self.txt_subject, 1, wx.EXPAND); g1.AddSpacer(0)
-        g1.Add(wx.StaticText(self, -1, _("MRI file 1:")),          0, wx.ALIGN_CENTER_VERTICAL)
-        g1.Add(self.txt_t1, 1, wx.EXPAND); g1.Add(btn_t1, 0)
+        g1.Add(wx.StaticText(self, -1, _("Subject ID:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g1.Add(self.txt_subject, 1, wx.EXPAND)
+        g1.AddSpacer(0)
+        g1.Add(wx.StaticText(self, -1, _("MRI file 1:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g1.Add(self.txt_t1, 1, wx.EXPAND)
+        g1.Add(btn_t1, 0)
         g1.Add(wx.StaticText(self, -1, _("MRI file 2:")), 0, wx.ALIGN_CENTER_VERTICAL)
-        g1.Add(self.txt_t2, 1, wx.EXPAND); g1.Add(btn_t2, 0)
-        g1.Add(wx.StaticText(self, -1, _("Output dir:")),  0, wx.ALIGN_CENTER_VERTICAL)
-        g1.Add(self.txt_hm_out, 1, wx.EXPAND); g1.Add(btn_hm_out, 0)
+        g1.Add(self.txt_t2, 1, wx.EXPAND)
+        g1.Add(btn_t2, 0)
+        g1.Add(wx.StaticText(self, -1, _("Output dir:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g1.Add(self.txt_hm_out, 1, wx.EXPAND)
+        g1.Add(btn_hm_out, 0)
         sz_hm.Add(g1, 0, wx.EXPAND | wx.ALL, 2)
 
         self.chk_forcerun = wx.CheckBox(self, -1, _("Force re-run (--forcerun)"))
         self.chk_forcerun.SetToolTip(
-            _("Overwrite an existing m2m_<subjectID> folder.\n"
-              "Required if you want to re-run charm for the same subject.")
+            _(
+                "Overwrite an existing m2m_<subjectID> folder.\n"
+                "Required if you want to re-run charm for the same subject."
+            )
         )
         sz_hm.Add(self.chk_forcerun, 0, wx.LEFT | wx.BOTTOM, 2)
 
         row_hm = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_run_charm    = wx.Button(self, -1, _("Run head model"), size=wx.Size(110, -1))
-        self.btn_cancel_charm = wx.Button(self, -1, _("Cancel"),          size=wx.Size(60,  -1))
+        self.btn_run_charm = wx.Button(self, -1, _("Run head model"), size=wx.Size(110, -1))
+        self.btn_cancel_charm = wx.Button(self, -1, _("Cancel"), size=wx.Size(60, -1))
         self.btn_cancel_charm.Enable(False)
-        self.btn_run_charm.Bind(wx.EVT_BUTTON,    self.OnRunCharm)
+        self.btn_run_charm.Bind(wx.EVT_BUTTON, self.OnRunCharm)
         self.btn_cancel_charm.Bind(wx.EVT_BUTTON, self.OnCancelCharm)
-        row_hm.Add(self.btn_run_charm,    1, wx.RIGHT, 2)
+        row_hm.Add(self.btn_run_charm, 1, wx.RIGHT, 2)
         row_hm.Add(self.btn_cancel_charm, 0)
         sz_hm.Add(row_hm, 0, wx.EXPAND | wx.ALL, 2)
 
-        self.gauge_charm  = wx.Gauge(self, -1, 100)
-        self.lbl_charm    = wx.StaticText(self, -1, _("Ready."))
+        self.gauge_charm = wx.Gauge(self, -1, 100)
+        self.lbl_charm = wx.StaticText(self, -1, _("Ready."))
         sz_hm.Add(self.gauge_charm, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
-        sz_hm.Add(self.lbl_charm,   0, wx.LEFT | wx.BOTTOM, 2)
+        sz_hm.Add(self.lbl_charm, 0, wx.LEFT | wx.BOTTOM, 2)
 
         self.btn_load_tissues = wx.Button(self, -1, _("Load tissue surfaces…"))
         self.btn_load_tissues.SetToolTip(
-            _("Select a tissue-label NIfTI from the m2m folder,\n"
-              "create one InVesalius mask per label and generate VTK surfaces.")
+            _(
+                "Select a tissue-label NIfTI from the m2m folder,\n"
+                "create one InVesalius mask per label and generate VTK surfaces."
+            )
         )
         self.btn_load_tissues.Bind(wx.EVT_BUTTON, self.OnLoadTissueSurfaces)
         sz_hm.Add(self.btn_load_tissues, 0, wx.ALL, 2)
 
         # TMS SIMULATION
-        box_sim  = wx.StaticBox(self, -1, _("TMS Simulation"))
-        sz_sim   = wx.StaticBoxSizer(box_sim, wx.VERTICAL)
+        box_sim = wx.StaticBox(self, -1, _("TMS Simulation"))
+        sz_sim = wx.StaticBoxSizer(box_sim, wx.VERTICAL)
 
-        self.txt_m2m     = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
+        self.txt_m2m = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
         self.txt_sim_out = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
-        self.txt_coil    = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
-        self.txt_didt    = wx.TextCtrl(self, -1, "1000000.0")
+        self.txt_coil = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
+        self.txt_didt = wx.TextCtrl(self, -1, "1000000.0")
 
-        btn_m2m     = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
+        btn_m2m = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
         btn_sim_out = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
-        btn_coil    = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
+        btn_coil = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
 
-        btn_m2m.Bind(wx.EVT_BUTTON,     self.OnBrowseM2M)
+        btn_m2m.Bind(wx.EVT_BUTTON, self.OnBrowseM2M)
         btn_sim_out.Bind(wx.EVT_BUTTON, self.OnBrowseSimOutput)
-        btn_coil.Bind(wx.EVT_BUTTON,    self.OnBrowseCoil)
+        btn_coil.Bind(wx.EVT_BUTTON, self.OnBrowseCoil)
 
         g2 = wx.FlexGridSizer(4, 3, 2, 2)
         g2.AddGrowableCol(1)
-        g2.Add(wx.StaticText(self, -1, _("m2m path:")),    0, wx.ALIGN_CENTER_VERTICAL)
-        g2.Add(self.txt_m2m, 1, wx.EXPAND); g2.Add(btn_m2m, 0)
-        g2.Add(wx.StaticText(self, -1, _("Output dir:")),  0, wx.ALIGN_CENTER_VERTICAL)
-        g2.Add(self.txt_sim_out, 1, wx.EXPAND); g2.Add(btn_sim_out, 0)
-        g2.Add(wx.StaticText(self, -1, _("Coil file:")),   0, wx.ALIGN_CENTER_VERTICAL)
-        g2.Add(self.txt_coil, 1, wx.EXPAND); g2.Add(btn_coil, 0)
+        g2.Add(wx.StaticText(self, -1, _("m2m path:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g2.Add(self.txt_m2m, 1, wx.EXPAND)
+        g2.Add(btn_m2m, 0)
+        g2.Add(wx.StaticText(self, -1, _("Output dir:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g2.Add(self.txt_sim_out, 1, wx.EXPAND)
+        g2.Add(btn_sim_out, 0)
+        g2.Add(wx.StaticText(self, -1, _("Coil file:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g2.Add(self.txt_coil, 1, wx.EXPAND)
+        g2.Add(btn_coil, 0)
         g2.Add(wx.StaticText(self, -1, _("dI/dt (A/s):")), 0, wx.ALIGN_CENTER_VERTICAL)
-        g2.Add(self.txt_didt, 1, wx.EXPAND); g2.AddSpacer(0)
+        g2.Add(self.txt_didt, 1, wx.EXPAND)
+        g2.AddSpacer(0)
         sz_sim.Add(g2, 0, wx.EXPAND | wx.ALL, 2)
 
         # matsimnibs display
         sz_sim.Add(wx.StaticText(self, -1, _("Coil pose (matsimnibs):")), 0, wx.LEFT | wx.TOP, 2)
         self.txt_mat = wx.TextCtrl(
-            self, -1, _("Identity — lock a pose first"),
+            self,
+            -1,
+            _("Identity — lock a pose first"),
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL,
             size=wx.Size(-1, 72),
         )
@@ -472,38 +495,42 @@ class InnerTaskPanel(wx.Panel):
         sz_sim.Add(self.btn_lock, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
 
         row_sim = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_run_sim    = wx.Button(self, -1, _("Run simulation"), size=wx.Size(110, -1))
-        self.btn_cancel_sim = wx.Button(self, -1, _("Cancel"),          size=wx.Size(60,  -1))
+        self.btn_run_sim = wx.Button(self, -1, _("Run simulation"), size=wx.Size(110, -1))
+        self.btn_cancel_sim = wx.Button(self, -1, _("Cancel"), size=wx.Size(60, -1))
         self.btn_run_sim.Enable(False)
         self.btn_cancel_sim.Enable(False)
-        self.btn_run_sim.Bind(wx.EVT_BUTTON,    self.OnRunSimulation)
+        self.btn_run_sim.Bind(wx.EVT_BUTTON, self.OnRunSimulation)
         self.btn_cancel_sim.Bind(wx.EVT_BUTTON, self.OnCancelSimulation)
-        row_sim.Add(self.btn_run_sim,    1, wx.RIGHT, 2)
+        row_sim.Add(self.btn_run_sim, 1, wx.RIGHT, 2)
         row_sim.Add(self.btn_cancel_sim, 0)
         sz_sim.Add(row_sim, 0, wx.EXPAND | wx.ALL, 2)
 
         self.gauge_sim = wx.Gauge(self, -1, 100)
-        self.lbl_sim   = wx.StaticText(self, -1, _("Load head surfaces first."))
+        self.lbl_sim = wx.StaticText(self, -1, _("Load head surfaces first."))
         sz_sim.Add(self.gauge_sim, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
-        sz_sim.Add(self.lbl_sim,   0, wx.LEFT | wx.BOTTOM, 2)
+        sz_sim.Add(self.lbl_sim, 0, wx.LEFT | wx.BOTTOM, 2)
 
         # E-FIELD VISUALIZATION
-        box_ef  = wx.StaticBox(self, -1, _("E-field Visualization"))
-        sz_ef   = wx.StaticBoxSizer(box_ef, wx.VERTICAL)
+        box_ef = wx.StaticBox(self, -1, _("E-field Visualization"))
+        sz_ef = wx.StaticBoxSizer(box_ef, wx.VERTICAL)
 
-        self.chk_gm   = wx.CheckBox(self, -1, _("Grey matter (GM)"))
+        self.chk_gm = wx.CheckBox(self, -1, _("Grey matter (GM)"))
         self.chk_skin = wx.CheckBox(self, -1, _("Skin"))
         self.chk_gm.SetValue(True)
         self.chk_skin.SetValue(True)
-        self.chk_gm.Bind(  wx.EVT_CHECKBOX, self.OnToggleGM)
+        self.chk_gm.Bind(wx.EVT_CHECKBOX, self.OnToggleGM)
         self.chk_skin.Bind(wx.EVT_CHECKBOX, self.OnToggleSkin)
-        sz_ef.Add(self.chk_gm,   0, wx.ALL, 2)
+        sz_ef.Add(self.chk_gm, 0, wx.ALL, 2)
         sz_ef.Add(self.chk_skin, 0, wx.LEFT | wx.BOTTOM, 2)
 
         row_cmap = wx.BoxSizer(wx.HORIZONTAL)
-        row_cmap.Add(wx.StaticText(self, -1, _("Colormap:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row_cmap.Add(
+            wx.StaticText(self, -1, _("Colormap:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+        )
         self.combo_cmap = wx.ComboBox(
-            self, -1, size=wx.Size(90, -1),
+            self,
+            -1,
+            size=wx.Size(90, -1),
             choices=["hot", "jet", "cool", "rainbow"],
             style=wx.CB_DROPDOWN | wx.CB_READONLY,
         )
@@ -513,21 +540,25 @@ class InnerTaskPanel(wx.Panel):
         sz_ef.Add(row_cmap, 0, wx.ALL, 2)
 
         row_op = wx.BoxSizer(wx.HORIZONTAL)
-        row_op.Add(wx.StaticText(self, -1, _("Skin opacity:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row_op.Add(
+            wx.StaticText(self, -1, _("Skin opacity:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+        )
         self.spin_opacity = wx.SpinCtrlDouble(self, -1, "", size=wx.Size(60, -1), inc=0.05)
         self.spin_opacity.SetRange(0.0, 1.0)
         self.spin_opacity.SetValue(0.4)
-        self.spin_opacity.Bind(wx.EVT_TEXT,     self.OnOpacity)
+        self.spin_opacity.Bind(wx.EVT_TEXT, self.OnOpacity)
         self.spin_opacity.Bind(wx.EVT_SPINCTRL, self.OnOpacity)
         row_op.Add(self.spin_opacity, 0)
         sz_ef.Add(row_op, 0, wx.ALL, 2)
 
         row_th = wx.BoxSizer(wx.HORIZONTAL)
-        row_th.Add(wx.StaticText(self, -1, _("Threshold %:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row_th.Add(
+            wx.StaticText(self, -1, _("Threshold %:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+        )
         self.spin_threshold = wx.SpinCtrlDouble(self, -1, "", size=wx.Size(60, -1), inc=1.0)
         self.spin_threshold.SetRange(0.0, 100.0)
         self.spin_threshold.SetValue(90.0)
-        self.spin_threshold.Bind(wx.EVT_TEXT,     self.OnThreshold)
+        self.spin_threshold.Bind(wx.EVT_TEXT, self.OnThreshold)
         self.spin_threshold.Bind(wx.EVT_SPINCTRL, self.OnThreshold)
         row_th.Add(self.spin_threshold, 0)
         sz_ef.Add(row_th, 0, wx.ALL, 2)
@@ -538,18 +569,18 @@ class InnerTaskPanel(wx.Panel):
 
         # outer sizer
         main = wx.BoxSizer(wx.VERTICAL)
-        main.Add(sz_hm,  0, wx.EXPAND | wx.ALL, 5)
+        main.Add(sz_hm, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_sim, 0, wx.EXPAND | wx.ALL, 5)
-        main.Add(sz_ef,  0, wx.EXPAND | wx.ALL, 5)
+        main.Add(sz_ef, 0, wx.EXPAND | wx.ALL, 5)
         self.SetSizer(main)
         self.Layout()
 
     def _restore_paths(self):
-        self.txt_m2m.SetValue(    self.session.GetConfig(_KEY_M2M_DIR,    ""))
+        self.txt_m2m.SetValue(self.session.GetConfig(_KEY_M2M_DIR, ""))
         self.txt_sim_out.SetValue(self.session.GetConfig(_KEY_OUTPUT_DIR, ""))
-        self.txt_coil.SetValue(   self.session.GetConfig(_KEY_COIL_FILE,  ""))
-        self.txt_t1.SetValue(     self.session.GetConfig(_KEY_T1_FILE,    ""))
-        self.txt_t2.SetValue(     self.session.GetConfig(_KEY_T2_FILE,    ""))
+        self.txt_coil.SetValue(self.session.GetConfig(_KEY_COIL_FILE, ""))
+        self.txt_t1.SetValue(self.session.GetConfig(_KEY_T1_FILE, ""))
+        self.txt_t2.SetValue(self.session.GetConfig(_KEY_T2_FILE, ""))
         if self.session.GetConfig(_KEY_M2M_DIR, ""):
             self.btn_run_sim.Enable(True)
 
@@ -569,8 +600,11 @@ class InnerTaskPanel(wx.Panel):
         path = None
         try:
             if dialog.ShowModal() == wx.ID_OK:
-                path = dialog.GetPath() if sys.platform == "win32" \
-                       else dialog.GetPath().encode("utf-8")
+                path = (
+                    dialog.GetPath()
+                    if sys.platform == "win32"
+                    else dialog.GetPath().encode("utf-8")
+                )
         except wx.PyAssertionError:
             if dialog.GetPath():
                 path = dialog.GetPath()
@@ -582,7 +616,7 @@ class InnerTaskPanel(wx.Panel):
 
     def _browse_dir(self, session_key, msg=""):
         current_dir = os.path.abspath(".")
-        last_dir    = self.session.GetConfig(session_key, "")
+        last_dir = self.session.GetConfig(session_key, "")
         dialog = wx.DirDialog(
             self,
             message=msg or _("Choose a folder:"),
@@ -592,8 +626,11 @@ class InnerTaskPanel(wx.Panel):
         path = None
         try:
             if dialog.ShowModal() == wx.ID_OK:
-                path = dialog.GetPath() if sys.platform == "win32" \
-                       else dialog.GetPath().encode("utf-8")
+                path = (
+                    dialog.GetPath()
+                    if sys.platform == "win32"
+                    else dialog.GetPath().encode("utf-8")
+                )
         except wx.PyAssertionError:
             if dialog.GetPath():
                 path = dialog.GetPath()
@@ -607,7 +644,8 @@ class InnerTaskPanel(wx.Panel):
     def OnBrowseT1(self, _evt):
         path = self._browse_file(
             _("NIfTI (*.nii;*.nii.gz)|*.nii;*.nii.gz|All files (*.*)|*.*"),
-            _KEY_T1_FILE, _("Select MRI file 1"),
+            _KEY_T1_FILE,
+            _("Select MRI file 1"),
         )
         if path:
             self.txt_t1.SetValue(path)
@@ -615,7 +653,8 @@ class InnerTaskPanel(wx.Panel):
     def OnBrowseT2(self, _evt):
         path = self._browse_file(
             _("NIfTI (*.nii;*.nii.gz)|*.nii;*.nii.gz|All files (*.*)|*.*"),
-            _KEY_T2_FILE, _("Select MRI file 2"),
+            _KEY_T2_FILE,
+            _("Select MRI file 2"),
         )
         if path:
             self.txt_t2.SetValue(path)
@@ -644,7 +683,8 @@ class InnerTaskPanel(wx.Panel):
     def OnBrowseCoil(self, _evt):
         path = self._browse_file(
             _("SimNIBS coil (*.tcd;*.ccd)|*.tcd;*.ccd|All files (*.*)|*.*"),
-            _KEY_COIL_FILE, _("Select SimNIBS coil file"),
+            _KEY_COIL_FILE,
+            _("Select SimNIBS coil file"),
         )
         if path:
             self.txt_coil.SetValue(path)
@@ -656,43 +696,48 @@ class InnerTaskPanel(wx.Panel):
         replace with real pubsub request to navigation module
         """
         wx.MessageBox(
-            _("Navigation integration not yet connected.\n"
-              "This will read the live coil pose once simnibs_handler is wired up."),
-            _("TODO"), wx.ICON_INFORMATION,
+            _(
+                "Navigation integration not yet connected.\n"
+                "This will read the live coil pose once simnibs_handler is wired up."
+            ),
+            _("TODO"),
+            wx.ICON_INFORMATION,
         )
 
     def _refresh_mat_display(self, mat=None):
         """Update the 4×4 matsimnibs text display."""
         import numpy as np
+
         m = mat if mat is not None else np.eye(4)
         lines = [
-            f"[ {m[r,0]:7.3f}  {m[r,1]:7.3f}  {m[r,2]:7.3f}  {m[r,3]:8.2f} ]"
-            for r in range(4)
+            f"[ {m[r, 0]:7.3f}  {m[r, 1]:7.3f}  {m[r, 2]:7.3f}  {m[r, 3]:8.2f} ]" for r in range(4)
         ]
         self.txt_mat.SetValue("\n".join(lines))
 
     def OnRunCharm(self, _evt):
         subject = self.txt_subject.GetValue().strip()
-        t1      = self.txt_t1.GetValue().strip()
-        t2      = self.txt_t2.GetValue().strip() or None
-        outdir  = self.txt_hm_out.GetValue().strip()
+        t1 = self.txt_t1.GetValue().strip()
+        t2 = self.txt_t2.GetValue().strip() or None
+        outdir = self.txt_hm_out.GetValue().strip()
 
         if not subject or not t1 or not outdir:
             wx.MessageBox(
                 _("Please fill in Subject ID, MRI file 1 path, and output folder."),
-                _("Missing input"), wx.ICON_WARNING,
+                _("Missing input"),
+                wx.ICON_WARNING,
             )
             return
 
         if not os.path.isfile(t1):
             wx.MessageBox(
                 _("MRI file 1 not found:\n{}").format(t1),
-                _("Missing input"), wx.ICON_WARNING,
+                _("Missing input"),
+                wx.ICON_WARNING,
             )
             return
 
         m2m_preview = os.path.join(outdir, f"m2m_{subject}")
-        forcerun    = self.chk_forcerun.GetValue()
+        forcerun = self.chk_forcerun.GetValue()
 
         msg = _(
             "charm will create the following folder on your computer:\n\n"
@@ -703,19 +748,24 @@ class InnerTaskPanel(wx.Panel):
         ).format(
             m2m_preview,
             _("\n\nThe existing folder will be overwritten (--forcerun is checked).")
-            if forcerun and os.path.isdir(m2m_preview) else "",
+            if forcerun and os.path.isdir(m2m_preview)
+            else "",
         )
 
-        if wx.MessageBox(msg, _("Run SimNIBS charm"),
-                         wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
+        if wx.MessageBox(msg, _("Run SimNIBS charm"), wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
             return
 
         os.makedirs(outdir, exist_ok=True)
 
         self._charm_runner = CharmRunner()
         self._charm_runner.start(
-            subject, t1, t2, outdir, forcerun,
-            self._charm_progress, self._charm_done,
+            subject,
+            t1,
+            t2,
+            outdir,
+            forcerun,
+            self._charm_progress,
+            self._charm_done,
         )
 
         self.btn_run_charm.Enable(False)
@@ -741,8 +791,7 @@ class InnerTaskPanel(wx.Panel):
         if not success:
             self.gauge_charm.SetValue(0)
             self.lbl_charm.SetLabel(_("charm failed."))
-            wx.MessageBox(error or _("charm failed."),
-                          _("SimNIBS error"), wx.ICON_ERROR)
+            wx.MessageBox(error or _("charm failed."), _("SimNIBS error"), wx.ICON_ERROR)
             return
 
         self.gauge_charm.SetValue(100)
@@ -783,7 +832,7 @@ class InnerTaskPanel(wx.Panel):
         if dlg.ShowModal() == wx.ID_OK:
             filepath = utils.decode(dlg.GetPath(), const.FS_ENCODE)
             self._load_tissue_surfaces(filepath)
-        dlg.Destroy() 
+        dlg.Destroy()
 
     def _load_tissue_surfaces(self, labels_nii: str) -> None:
         """
@@ -797,22 +846,25 @@ class InnerTaskPanel(wx.Panel):
         """
         import nibabel as nib
         import numpy as np
+
         import invesalius.project as prj
 
         try:
-            nii  = nib.load(labels_nii)
+            nii = nib.load(labels_nii)
             data = np.asarray(nii.dataobj)
         except Exception as exc:
             wx.MessageBox(
                 _("Could not read NIfTI file:\n{}").format(exc),
-                _("SimNIBS"), wx.ICON_ERROR,
+                _("SimNIBS"),
+                wx.ICON_ERROR,
             )
             return
 
         present = sorted(int(v) for v in np.unique(data) if v > 0)
         if not present:
-            wx.MessageBox(_("No tissue labels found in the selected file."),
-                          _("SimNIBS"), wx.ICON_WARNING)
+            wx.MessageBox(
+                _("No tissue labels found in the selected file."), _("SimNIBS"), wx.ICON_WARNING
+            )
             return
 
         info = _label_info(present)
@@ -822,8 +874,8 @@ class InnerTaskPanel(wx.Panel):
             name, _colour = info[label]
             mask_name = f"{name}"
 
-            binary    = (data == label).astype(np.uint8) * 255
-            mask_img  = nib.Nifti1Image(binary, nii.affine, nii.header)
+            binary = (data == label).astype(np.uint8) * 255
+            mask_img = nib.Nifti1Image(binary, nii.affine, nii.header)
 
             with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as fh:
                 tmp = fh.name
@@ -831,13 +883,13 @@ class InnerTaskPanel(wx.Panel):
                 nib.save(mask_img, tmp)
                 Publisher.sendMessage("Import Nifti mask", filepath=tmp, mask_name=mask_name)
                 proj = prj.Project()
-                idx  = max(proj.mask_dict.keys())
+                idx = max(proj.mask_dict.keys())
                 created.append((idx, mask_name))
             except Exception as exc:
                 wx.MessageBox(
-                    _("Could not import mask for label {} ({}):\n{}").format(
-                        label, name, exc),
-                    _("SimNIBS"), wx.ICON_WARNING,
+                    _("Could not import mask for label {} ({}):\n{}").format(label, name, exc),
+                    _("SimNIBS"),
+                    wx.ICON_WARNING,
                 )
             finally:
                 try:
@@ -847,24 +899,31 @@ class InnerTaskPanel(wx.Panel):
 
         for mask_idx, mask_name in created:
             surface_params = {
-                "method":  {"algorithm": "Default", "options": {}},
+                "method": {
+                    "algorithm": "ca_smoothing",
+                    "options": {
+                        "angle": 0.7,
+                        "max distance": 3.0,
+                        "min weight": 0.5,
+                        "steps": 10,
+                    },
+                },
                 "options": {
-                    "index":             mask_idx,
-                    "name":              mask_name,
-                    "quality":           _("Optimal *"),
-                    "fill":              False,
+                    "index": mask_idx,
+                    "name": mask_name,
+                    "quality": _("Optimal *"),
+                    "fill": False,
                     "fill_border_holes": False,
-                    "keep_largest":      True,
-                    "overwrite":         False,
+                    "keep_largest": True,
+                    "overwrite": False,
                 },
             }
-            Publisher.sendMessage("Create surface from index",
-                                  surface_parameters=surface_params)
+            Publisher.sendMessage("Create surface from index", surface_parameters=surface_params)
 
     def OnRunSimulation(self, _evt):
         m2m_path = self.txt_m2m.GetValue().strip()
-        out_dir  = self.txt_sim_out.GetValue().strip()
-        coil     = self.txt_coil.GetValue().strip()
+        out_dir = self.txt_sim_out.GetValue().strip()
+        coil = self.txt_coil.GetValue().strip()
 
         try:
             didt = float(self.txt_didt.GetValue())
@@ -875,7 +934,8 @@ class InnerTaskPanel(wx.Panel):
         if not m2m_path or not out_dir or not coil:
             wx.MessageBox(
                 _("Please fill in m2m path, output folder, and coil file."),
-                _("Missing input"), wx.ICON_WARNING,
+                _("Missing input"),
+                wx.ICON_WARNING,
             )
             return
 
@@ -927,7 +987,6 @@ class InnerTaskPanel(wx.Panel):
         self.lbl_sim.SetLabel(f"Error: {message}")
         wx.MessageBox(message, _("SimNIBS error"), wx.ICON_ERROR | wx.OK)
 
-
     def OnToggleGM(self, evt):
         Publisher.sendMessage(TOPIC_SET_VISIBILITY, name="gm", visible=evt.IsChecked())
 
@@ -946,12 +1005,11 @@ class InnerTaskPanel(wx.Panel):
     def OnRemove(self, _evt):
         Publisher.sendMessage(TOPIC_REMOVE_SURFACES)
 
-
     @staticmethod
     def _head_msh_from_m2m(m2m_path: str) -> str:
         """m2m_ernie/ → m2m_ernie/ernie.msh"""
         folder = os.path.basename(os.path.normpath(m2m_path))
-        subj   = folder[4:] if folder.startswith("m2m_") else folder
+        subj = folder[4:] if folder.startswith("m2m_") else folder
         return os.path.join(m2m_path, f"{subj}.msh")
 
     @staticmethod
@@ -959,10 +1017,16 @@ class InnerTaskPanel(wx.Panel):
         """Return (and create) the next simulations/session_NNN/ folder."""
         sim_root = os.path.join(output_dir, "simulations")
         os.makedirs(sim_root, exist_ok=True)
-        n = len([
-            d for d in os.listdir(sim_root)
-            if d.startswith("session_") and os.path.isdir(os.path.join(sim_root, d))
-        ]) + 1
+        n = (
+            len(
+                [
+                    d
+                    for d in os.listdir(sim_root)
+                    if d.startswith("session_") and os.path.isdir(os.path.join(sim_root, d))
+                ]
+            )
+            + 1
+        )
         path = os.path.join(sim_root, f"session_{n:03d}")
         os.makedirs(path, exist_ok=True)
         return path
