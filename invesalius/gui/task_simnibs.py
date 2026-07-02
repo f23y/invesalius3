@@ -17,15 +17,14 @@
 #    detalhes.
 # --------------------------------------------------------------------------
 
+import logging
 import os
-import re
 import shutil
-import signal
-import subprocess
 import sys
 import tempfile
 import threading
 
+import socketio as sio_module
 import wx
 
 import invesalius.constants as const
@@ -34,12 +33,16 @@ import invesalius.utils as utils
 from invesalius.i18n import tr as _
 from invesalius.pubsub import pub as Publisher
 
+log = logging.getLogger(__name__)
+
 _KEY_M2M_DIR = "simnibs_last_m2m_dir"
 _KEY_OUTPUT_DIR = "simnibs_last_output_dir"
 _KEY_COIL_FILE = "simnibs_last_coil_file"
 _KEY_T1_FILE = "simnibs_last_t1_file"
 _KEY_T2_FILE = "simnibs_last_t2_file"
-_KEY_SIMNIBS_EXE = "simnibs_executable_path"
+_KEY_RELAY_URL = "simnibs_relay_url"
+
+_DEFAULT_RELAY_URL = "http://127.0.0.1:5000"
 
 # Pubsub topic strings
 TOPIC_LOAD_SURFACES = "Load SimNIBS surfaces"
@@ -53,26 +56,27 @@ TOPIC_SURFACES_LOADED = "SimNIBS surfaces loaded"
 TOPIC_EFIELD_LOADED = "SimNIBS efield loaded"
 TOPIC_PROGRESS = "SimNIBS progress"
 TOPIC_ERROR = "SimNIBS error"
+TOPIC_CHARM_DONE = "SimNIBS charm done"
+TOPIC_RELAY_CONNECTED = "SimNIBS relay connected"
+TOPIC_RELAY_DISCONNECTED = "SimNIBS relay disconnected"
 
-
-# Find SimNIBS
-
-_SIMNIBS_ROOTS = [
-    os.path.expanduser("~/SimNIBS-4.6"),
-    os.path.expanduser("~/SimNIBS-4.5"),
-    os.path.expanduser("~/SimNIBS-4"),
-    os.path.expanduser("~/SimNIBS-3.2"),
-    os.path.expanduser("~/.local"),
-    "/usr/local",
-    "/opt/simnibs",
-]
+# Navigation module publishes current coil pose on this topic.
+TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
 
 
 def _find_charm() -> str | None:
     path = shutil.which("charm")
     if path:
         return path
-    for root in _SIMNIBS_ROOTS:
+    for root in [
+        os.path.expanduser("~/SimNIBS-4.6"),
+        os.path.expanduser("~/SimNIBS-4.5"),
+        os.path.expanduser("~/SimNIBS-4"),
+        os.path.expanduser("~/SimNIBS-3.2"),
+        os.path.expanduser("~/.local"),
+        "/usr/local",
+        "/opt/simnibs",
+    ]:
         candidate = os.path.join(root, "bin", "charm")
         if os.path.isfile(candidate):
             return candidate
@@ -92,26 +96,9 @@ def _simnibs_site_packages() -> str | None:
     return candidates[0] if candidates else None
 
 
-# def _try_import_gmsh():
-#     """Import gmsh, falling back to the SimNIBS-bundled copy if needed."""
-#     try:
-#         import gmsh
-#         return gmsh
-#     except ImportError:
-#         sp = _simnibs_site_packages()
-#         if sp and sp not in sys.path:
-#             sys.path.insert(0, sp)
-#         try:
-#             import gmsh
-#             return gmsh
-#         except ImportError:
-#             return None
-
-
 def _read_lut() -> dict:
-    """
-    Parse final_tissues_FreeSurferColorLUT.txt bundled with SimNIBS.
-    Returns {label: (name, (r, g, b))}.
+    """Parse final_tissues_FreeSurferColorLUT.txt bundled with SimNIBS.
+    Returns {label: (name, (r, g, b))}. Returns {} if SimNIBS is not installed locally.
     """
     sp = _simnibs_site_packages()
     if not sp:
@@ -138,79 +125,9 @@ def _read_lut() -> dict:
     return result
 
 
-# def _discover_tissues(m2m_dir: str) -> list:
-#     """
-#     Return [(name, nifti_label, (r, g, b)), ...] for each tissue surface.
-
-#     Strategy — first succeeding method wins:
-#       1. gmsh Python API on the subject .msh file (reads actual physical-group
-#          names, adapts automatically to any SimNIBS tissue configuration).
-#       2. SimNIBS FreeSurfer colour LUT + standard fallback labels.
-#     """
-#     import logging
-#     log = logging.getLogger(__name__)
-
-#     subject = os.path.basename(m2m_dir)
-#     if subject.startswith("m2m_"):
-#         subject = subject[4:]
-#     msh_file = os.path.join(m2m_dir, f"{subject}.msh")
-
-#     lut = _read_lut()
-
-#     gmsh = _try_import_gmsh()
-#     if gmsh and os.path.isfile(msh_file):
-#         try:
-#             gmsh.initialize()
-#             gmsh.model.open(msh_file)
-#             entities = gmsh.model.getEntities()
-#             log.info("SimNIBS mesh entities: %s", entities)
-#             seen: dict = {}
-#             for dim, tag in entities:
-#                 if dim != 2:
-#                     continue
-#                 name = gmsh.model.getPhysicalName(dim, tag)
-#                 if not name:
-#                     continue
-#                 # SimNIBS convention: surface tag = 1000 + volume label
-#                 label = tag - 1000 if tag >= 1000 else tag
-#                 if label > 0:
-#                     seen[label] = name
-#             gmsh.finalize()
-#             if seen:
-#                 result = []
-#                 for label, name in sorted(seen.items()):
-#                     colour = lut.get(label, (None, (200, 200, 200)))[1]
-#                     result.append((name, label, colour))
-#                 log.info("Tissues from gmsh: %s", result)
-#                 return result
-#         except Exception as exc:
-#             log.warning("gmsh tissue discovery failed: %s", exc)
-#             try:
-#                 gmsh.finalize()
-#             except Exception:
-#                 pass
-
-#     # Fallback: standard SimNIBS labels augmented by the LUT where available
-#     defaults = [
-#         (1, "WM",    (230, 230, 230)),
-#         (2, "GM",    (129, 129, 129)),
-#         (3, "CSF",   (104, 163, 255)),
-#         (4, "Bone",  (255, 239, 179)),
-#         (5, "Scalp", (255, 166, 133)),
-#     ]
-#     result = []
-#     for label, default_name, default_colour in defaults:
-#         name, colour = lut.get(label, (default_name, default_colour))
-#         result.append((name, label, colour))
-#     log.info("Tissues from fallback: %s", result)
-#     return result
-
-
 def _label_info(present_labels: list) -> dict:
-    """
-    Return {label: (name, (r, g, b))} for each integer label found in a
-    NIfTI file.  Names come from the SimNIBS FreeSurfer colour LUT when
-    available; unknown labels receive a generic ``tissue_N`` name.
+    """Return {label: (name, (r, g, b))} for each label.
+    Names come from the SimNIBS LUT when available; unknown labels get tissue_N.
     """
     lut = _read_lut()
     result: dict = {}
@@ -222,116 +139,116 @@ def _label_info(present_labels: list) -> dict:
     return result
 
 
-# runs SimNIBS charm in a background thread
-class CharmRunner:
-    """
-    Runs ``charm [--forcerun] subid T1 [T2]`` in a background daemon thread.
+class SimNIBSRelayClient:
+    """Socket.IO client that bridges the InVesalius panel to the SimNIBS server.
 
-    Callbacks are delivered on the wx main thread via wx.CallAfter:
-      progress_cb(message: str, percent: int)
-      done_cb(success: bool, error: str | None, m2m_dir: str | None)
+    Emits commands on ``from_neuronavigation`` and listens on
+    ``to_neuronavigation`` for responses from the SimNIBS processing server.
+    Incoming messages are dispatched to InVesalius pubsub via wx.CallAfter so
+    all UI updates happen on the wx main thread.
     """
 
-    def __init__(self):
-        self._proc: subprocess.Popen | None = None
+    def __init__(self) -> None:
+        self._sio: sio_module.Client | None = None
         self._thread: threading.Thread | None = None
+        self._url = ""
+        self.connected = False
 
-    def start(
-        self,
-        subject: str,
-        t1: str,
-        t2: str | None,
-        outdir: str,
-        forcerun: bool,
-        progress_cb,
-        done_cb,
-    ) -> None:
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(subject, t1, t2, outdir, forcerun, progress_cb, done_cb),
-            daemon=True,
-        )
+    def connect(self, url: str) -> None:
+        if self._thread and self._thread.is_alive():
+            self.disconnect()
+        self._url = url
+        self._thread = threading.Thread(target=self._run, daemon=True, name="simnibs-relay-client")
         self._thread.start()
 
-    def cancel(self) -> None:
-        if self._proc and self._proc.poll() is None:
-            if sys.platform == "win32":
-                subprocess.call(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)])
-            else:
-                try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+    def disconnect(self) -> None:
+        if self._sio:
+            try:
+                self._sio.disconnect()
+            except Exception:
+                pass
 
-    def _run(self, subject, t1, t2, outdir, forcerun, progress_cb, done_cb):
-        charm_exe = _find_charm()
-        if not charm_exe:
-            wx.CallAfter(
-                done_cb,
-                False,
-                _(
-                    "charm executable not found.\n"
-                    "Install SimNIBS and ensure it is on PATH or a standard location."
-                ),
-                None,
-            )
-            return
+    def send(self, topic: str, data: dict) -> bool:
+        """Emit a command to the SimNIBS server via the relay.
 
-        cmd = [charm_exe]
-        if forcerun:
-            cmd.append("--forcerun")
-        cmd.append(subject)
-        cmd.append(t1)
-        if t2:
-            cmd.append(t2)
-
-        pg_kwargs: dict = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-            if sys.platform == "win32"
-            else {"start_new_session": True}
-        )
+        Returns True if the emit succeeded, False if not connected.
+        """
+        if not self._sio or not self.connected:
+            log.warning("SimNIBSRelayClient: cannot send '%s' — not connected", topic)
+            return False
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                cwd=outdir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                **pg_kwargs,
-            )
-            percent = 0
-            for raw in self._proc.stdout:
-                line = raw.rstrip()
-                if not line:
-                    continue
-                m = re.search(r"(\d+)\s*%", line)
-                if m:
-                    percent = min(int(m.group(1)), 99)
-                else:
-                    percent = min(percent + 1, 99)
-                wx.CallAfter(progress_cb, line, percent)
-            self._proc.wait()
-            rc = self._proc.returncode
+            self._sio.emit("from_neuronavigation", {"topic": topic, "data": data})
+            return True
         except Exception as exc:
-            wx.CallAfter(done_cb, False, str(exc), None)
-            return
+            log.error("SimNIBSRelayClient: emit failed for '%s': %s", topic, exc)
+            return False
 
-        if rc != 0:
-            wx.CallAfter(done_cb, False, _("charm exited with code {}").format(rc), None)
-            return
+    def _run(self) -> None:
+        self._sio = sio_module.Client(
+            logger=False,
+            engineio_logger=False,
+            reconnection=True,
+            reconnection_attempts=0,
+            reconnection_delay=1,
+            reconnection_delay_max=10,
+        )
 
-        m2m_dir = os.path.join(outdir, f"m2m_{subject}")
-        if not os.path.isdir(m2m_dir):
-            wx.CallAfter(
-                done_cb,
-                False,
-                _("Expected output folder not found:\n{}").format(m2m_dir),
-                None,
+        @self._sio.event
+        def connect():
+            self.connected = True
+            log.info("SimNIBSRelayClient: connected to %s", self._url)
+            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_CONNECTED)
+
+        @self._sio.event
+        def disconnect():
+            self.connected = False
+            log.warning("SimNIBSRelayClient: disconnected")
+            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_DISCONNECTED)
+
+        @self._sio.event
+        def connect_error(data):
+            self.connected = False
+            log.warning("SimNIBSRelayClient: connection error: %s", data)
+            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_DISCONNECTED)
+
+        @self._sio.on("to_neuronavigation")
+        def on_msg(msg):
+            if isinstance(msg, dict) and "topic" in msg:
+                wx.CallAfter(self._dispatch, msg["topic"], msg.get("data", {}))
+            else:
+                log.warning("SimNIBSRelayClient: unexpected message shape: %s", msg)
+
+        try:
+            self._sio.connect(
+                self._url,
+                transports=["websocket", "polling"],
+                wait_timeout=10,
             )
-            return
+            self._sio.wait()
+        except Exception as exc:
+            log.warning("SimNIBSRelayClient: %s", exc)
+            self.connected = False
+            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_DISCONNECTED)
 
-        wx.CallAfter(done_cb, True, None, m2m_dir)
+    @staticmethod
+    def _dispatch(topic: str, data: dict) -> None:
+        """Convert relay messages to InVesalius pubsub events (main thread)."""
+        if topic == "SimNIBS progress":
+            Publisher.sendMessage(
+                TOPIC_PROGRESS,
+                message=data.get("message", ""),
+                percent=data.get("percent", 0),
+            )
+        elif topic == "Charm done":
+            Publisher.sendMessage(TOPIC_CHARM_DONE, m2m_dir=data.get("m2m_dir", ""))
+        elif topic == "SimNIBS efield loaded":
+            Publisher.sendMessage(TOPIC_EFIELD_LOADED, stats=data)
+        elif topic == "SimNIBS error":
+            Publisher.sendMessage(TOPIC_ERROR, message=data.get("message", "Unknown error"))
+        elif topic == "Open other files":
+            filepath = data.get("filepath", "")
+            if filepath:
+                Publisher.sendMessage("Open other files", filepath=filepath)
 
 
 class TaskPanel(wx.ScrolledWindow):
@@ -353,10 +270,11 @@ class TaskPanel(wx.ScrolledWindow):
 
 class InnerTaskPanel(wx.Panel):
     """
-    Three collapsible sections:
-      1. Head Model   — charm segmentation inputs
-      2. Simulation   — coil / pose / run controls
-      3. E-field View — overlay / colormap / threshold
+    Four collapsible sections:
+      0. Relay Server  — connect to the SimNIBS processing server
+      1. Head Model    — charm segmentation inputs
+      2. Simulation    — coil / pose / run controls
+      3. E-field View  — overlay / colormap / threshold
     """
 
     def __init__(self, parent):
@@ -367,6 +285,10 @@ class InnerTaskPanel(wx.Panel):
         self.session = ses.Session()
         self._m2m_path = None
         self._pose_locked = False
+        self._matsimnibs = None  # 4×4 matrix as nested list, from navigation
+        self._running = None  # "charm" | "sim" | None — tracks active job
+        self._relay = SimNIBSRelayClient()
+        self._surface_names: list[str] = []
 
         self._subscribe()
         self._build_ui()
@@ -377,8 +299,24 @@ class InnerTaskPanel(wx.Panel):
         Publisher.subscribe(self._on_efield_loaded, TOPIC_EFIELD_LOADED)
         Publisher.subscribe(self._on_progress, TOPIC_PROGRESS)
         Publisher.subscribe(self._on_error, TOPIC_ERROR)
+        Publisher.subscribe(self._on_charm_done, TOPIC_CHARM_DONE)
+        Publisher.subscribe(self._on_coil_pose, TOPIC_COIL_POSE)
+        Publisher.subscribe(self._on_relay_connected, TOPIC_RELAY_CONNECTED)
+        Publisher.subscribe(self._on_relay_disconnected, TOPIC_RELAY_DISCONNECTED)
 
     def _build_ui(self):
+        # RELAY SERVER
+        box_relay = wx.StaticBox(self, -1, _("SimNIBS Relay Server"))
+        sz_relay = wx.StaticBoxSizer(box_relay, wx.HORIZONTAL)
+        self.txt_relay = wx.TextCtrl(self, -1, _DEFAULT_RELAY_URL)
+        self.btn_connect = wx.Button(self, -1, _("Connect"), size=wx.Size(80, -1))
+        self.lbl_relay = wx.StaticText(self, -1, _("Disconnected"))
+        self.lbl_relay.SetForegroundColour(wx.Colour(180, 0, 0))
+        self.btn_connect.Bind(wx.EVT_BUTTON, self.OnConnect)
+        sz_relay.Add(self.txt_relay, 1, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
+        sz_relay.Add(self.btn_connect, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
+        sz_relay.Add(self.lbl_relay, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
+
         # HEAD MODEL
         box_hm = wx.StaticBox(self, -1, _("Head Model (charm)"))
         sz_hm = wx.StaticBoxSizer(box_hm, wx.VERTICAL)
@@ -420,6 +358,34 @@ class InnerTaskPanel(wx.Panel):
             )
         )
         sz_hm.Add(self.chk_forcerun, 0, wx.LEFT | wx.BOTTOM, 2)
+
+        self.radio_qsform = wx.RadioBox(
+            self,
+            -1,
+            _("qform/sform mismatch"),
+            choices=[
+                _("Do nothing"),
+                _("Force qform"),
+                _("Force sform"),
+            ],
+            majorDimension=1,
+            style=wx.RA_SPECIFY_ROWS,
+        )
+        self.radio_qsform.SetSelection(1)
+        self.radio_qsform.SetToolTip(
+            _(
+                "charm requires the qform and sform in the T1 NIfTI header to match.\n\n"
+                "'Force qform' replaces sform with qform and is what charm itself\n"
+                "recommends when it reports a qform/sform mismatch (the common case).\n\n"
+                "'Force sform' replaces qform with sform (and strips shears); only use\n"
+                "this if the qform code is unknown/invalid.\n\n"
+                "Important: if 'Force qform' is used, the original sform is overwritten.\n"
+                "Neuronavigation software must then be set up with the SimNIBS-processed\n"
+                "T1.nii.gz from the m2m_<subjectID> folder, not the original input MRI —\n"
+                "otherwise coil pose import/export will be misaligned."
+            )
+        )
+        sz_hm.Add(self.radio_qsform, 0, wx.EXPAND | wx.LEFT | wx.BOTTOM, 2)
 
         row_hm = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_run_charm = wx.Button(self, -1, _("Run head model"), size=wx.Size(110, -1))
@@ -484,7 +450,7 @@ class InnerTaskPanel(wx.Panel):
         self.txt_mat = wx.TextCtrl(
             self,
             -1,
-            _("Identity — lock a pose first"),
+            _("No pose — navigation must send a coil pose first"),
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL,
             size=wx.Size(-1, 72),
         )
@@ -514,14 +480,20 @@ class InnerTaskPanel(wx.Panel):
         box_ef = wx.StaticBox(self, -1, _("E-field Visualization"))
         sz_ef = wx.StaticBoxSizer(box_ef, wx.VERTICAL)
 
-        self.chk_gm = wx.CheckBox(self, -1, _("Grey matter (GM)"))
-        self.chk_skin = wx.CheckBox(self, -1, _("Skin"))
-        self.chk_gm.SetValue(True)
-        self.chk_skin.SetValue(True)
-        self.chk_gm.Bind(wx.EVT_CHECKBOX, self.OnToggleGM)
-        self.chk_skin.Bind(wx.EVT_CHECKBOX, self.OnToggleSkin)
-        sz_ef.Add(self.chk_gm, 0, wx.ALL, 2)
-        sz_ef.Add(self.chk_skin, 0, wx.LEFT | wx.BOTTOM, 2)
+        row_surf = wx.BoxSizer(wx.HORIZONTAL)
+        row_surf.Add(
+            wx.StaticText(self, -1, _("Surface:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+        )
+        self.combo_surface = wx.ComboBox(self, -1, style=wx.CB_DROPDOWN | wx.CB_READONLY)
+        self.combo_surface.SetToolTip(
+            _(
+                "Choose which tissue surface the E-field is overlaid on.\n"
+                "Populated after loading tissue surfaces from the m2m folder."
+            )
+        )
+        self.combo_surface.Bind(wx.EVT_COMBOBOX, self.OnSurfaceSelect)
+        row_surf.Add(self.combo_surface, 1)
+        sz_ef.Add(row_surf, 0, wx.EXPAND | wx.ALL, 2)
 
         row_cmap = wx.BoxSizer(wx.HORIZONTAL)
         row_cmap.Add(
@@ -569,6 +541,7 @@ class InnerTaskPanel(wx.Panel):
 
         # outer sizer
         main = wx.BoxSizer(wx.VERTICAL)
+        main.Add(sz_relay, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_hm, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_sim, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_ef, 0, wx.EXPAND | wx.ALL, 5)
@@ -576,6 +549,8 @@ class InnerTaskPanel(wx.Panel):
         self.Layout()
 
     def _restore_paths(self):
+        relay_url = self.session.GetConfig(_KEY_RELAY_URL, _DEFAULT_RELAY_URL)
+        self.txt_relay.SetValue(relay_url)
         self.txt_m2m.SetValue(self.session.GetConfig(_KEY_M2M_DIR, ""))
         self.txt_sim_out.SetValue(self.session.GetConfig(_KEY_OUTPUT_DIR, ""))
         self.txt_coil.SetValue(self.session.GetConfig(_KEY_COIL_FILE, ""))
@@ -583,6 +558,8 @@ class InnerTaskPanel(wx.Panel):
         self.txt_t2.SetValue(self.session.GetConfig(_KEY_T2_FILE, ""))
         if self.session.GetConfig(_KEY_M2M_DIR, ""):
             self.btn_run_sim.Enable(True)
+        if relay_url:
+            self._relay.connect(relay_url)
 
     def _save_path(self, key, value):
         self.session.SetConfig(key, value)
@@ -641,6 +618,26 @@ class InnerTaskPanel(wx.Panel):
             self._save_path(session_key, path)
         return path
 
+    def OnConnect(self, _evt):
+        if self._relay.connected:
+            self._relay.disconnect()
+        else:
+            url = self.txt_relay.GetValue().strip() or _DEFAULT_RELAY_URL
+            self._save_path(_KEY_RELAY_URL, url)
+            self._relay.connect(url)
+
+    def _on_relay_connected(self):
+        self.lbl_relay.SetLabel(_("Connected"))
+        self.lbl_relay.SetForegroundColour(wx.Colour(0, 150, 0))
+        self.btn_connect.SetLabel(_("Disconnect"))
+        self.Layout()
+
+    def _on_relay_disconnected(self):
+        self.lbl_relay.SetLabel(_("Disconnected"))
+        self.lbl_relay.SetForegroundColour(wx.Colour(180, 0, 0))
+        self.btn_connect.SetLabel(_("Connect"))
+        self.Layout()
+
     def OnBrowseT1(self, _evt):
         path = self._browse_file(
             _("NIfTI (*.nii;*.nii.gz)|*.nii;*.nii.gz|All files (*.*)|*.*"),
@@ -671,9 +668,6 @@ class InnerTaskPanel(wx.Panel):
             self._m2m_path = path
             self._save_path(_KEY_M2M_DIR, path)
             self.btn_run_sim.Enable(True)
-            # TODO: fire TOPIC_LOAD_SURFACES once simnibs_handler is ready
-            # head_msh = self._head_msh_from_m2m(path)
-            # Publisher.sendMessage(TOPIC_LOAD_SURFACES, msh_path=head_msh, tags=[1002, 1005])
 
     def OnBrowseSimOutput(self, _evt):
         path = self._browse_dir(_KEY_OUTPUT_DIR, _("Choose simulation output folder"))
@@ -689,31 +683,6 @@ class InnerTaskPanel(wx.Panel):
         if path:
             self.txt_coil.SetValue(path)
 
-    def OnLockPose(self, _evt):
-        """Read live coil pose from the navigation module via pubsub.
-
-        TODO: wire up when navigation integration is confirmed.
-        replace with real pubsub request to navigation module
-        """
-        wx.MessageBox(
-            _(
-                "Navigation integration not yet connected.\n"
-                "This will read the live coil pose once simnibs_handler is wired up."
-            ),
-            _("TODO"),
-            wx.ICON_INFORMATION,
-        )
-
-    def _refresh_mat_display(self, mat=None):
-        """Update the 4×4 matsimnibs text display."""
-        import numpy as np
-
-        m = mat if mat is not None else np.eye(4)
-        lines = [
-            f"[ {m[r, 0]:7.3f}  {m[r, 1]:7.3f}  {m[r, 2]:7.3f}  {m[r, 3]:8.2f} ]" for r in range(4)
-        ]
-        self.txt_mat.SetValue("\n".join(lines))
-
     def OnRunCharm(self, _evt):
         subject = self.txt_subject.GetValue().strip()
         t1 = self.txt_t1.GetValue().strip()
@@ -728,93 +697,88 @@ class InnerTaskPanel(wx.Panel):
             )
             return
 
-        if not os.path.isfile(t1):
+        if not self._relay.connected:
             wx.MessageBox(
-                _("MRI file 1 not found:\n{}").format(t1),
-                _("Missing input"),
+                _(
+                    "Not connected to the SimNIBS relay server.\n"
+                    "Please enter the relay URL and click Connect."
+                ),
+                _("Not connected"),
                 wx.ICON_WARNING,
             )
             return
 
-        m2m_preview = os.path.join(outdir, f"m2m_{subject}")
+        subject_dir = os.path.join(outdir, f"m2m_{subject}")
         forcerun = self.chk_forcerun.GetValue()
+        qsform_choice = self.radio_qsform.GetSelection()
+        force_qform = qsform_choice == 1
+        force_sform = qsform_choice == 2
 
         msg = _(
-            "charm will create the following folder on your computer:\n\n"
+            "charm will create the following folder on the SimNIBS server:\n\n"
             "  {}\n\n"
             "This may take 30–60 minutes and requires several GB of free disk space."
             "{}"
+            "{}"
             "\n\nProceed?"
         ).format(
-            m2m_preview,
+            subject_dir,
             _("\n\nThe existing folder will be overwritten (--forcerun is checked).")
-            if forcerun and os.path.isdir(m2m_preview)
+            if forcerun
+            else "",
+            _(
+                "\n\nNote: --forceqform will be used, which overwrites the sform in the "
+                "NIfTI header.\nFor neuronavigation, use the SimNIBS-processed T1.nii.gz "
+                "from the m2m folder,\nnot the original input MRI."
+            )
+            if force_qform
             else "",
         )
 
         if wx.MessageBox(msg, _("Run SimNIBS charm"), wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
             return
 
-        os.makedirs(outdir, exist_ok=True)
-
-        self._charm_runner = CharmRunner()
-        self._charm_runner.start(
-            subject,
-            t1,
-            t2,
-            outdir,
-            forcerun,
-            self._charm_progress,
-            self._charm_done,
+        mri_files = [t1] + ([t2] if t2 else [])
+        sent = self._relay.send(
+            "SimNIBS: Run charm",
+            {
+                "subject_dir": subject_dir,
+                "mri_files": mri_files,
+                "forcerun": forcerun,
+                "force_qform": force_qform,
+                "force_sform": force_sform,
+            },
         )
+        if not sent:
+            wx.MessageBox(
+                _("Failed to send command to the SimNIBS server."), _("Error"), wx.ICON_ERROR
+            )
+            return
 
+        self._running = "charm"
         self.btn_run_charm.Enable(False)
         self.btn_cancel_charm.Enable(True)
         self.gauge_charm.SetValue(0)
-        self.lbl_charm.SetLabel(_("Starting charm…"))
+        self.lbl_charm.SetLabel(_("Sent to SimNIBS server…"))
 
     def OnCancelCharm(self, _evt):
-        if hasattr(self, "_charm_runner"):
-            self._charm_runner.cancel()
+        self._relay.send("SimNIBS: Cancel charm", {})
+        self._running = None
         self.btn_run_charm.Enable(True)
         self.btn_cancel_charm.Enable(False)
-        self.lbl_charm.SetLabel(_("Cancelled."))
+        self.lbl_charm.SetLabel(_("Cancel requested."))
 
-    def _charm_progress(self, message, percent):
-        self.gauge_charm.SetValue(int(percent or 0))
-        self.lbl_charm.SetLabel(message)
-
-    def _charm_done(self, success, error, m2m_dir):
+    def _on_charm_done(self, m2m_dir):
+        self._running = None
         self.btn_run_charm.Enable(True)
         self.btn_cancel_charm.Enable(False)
-
-        if not success:
-            self.gauge_charm.SetValue(0)
-            self.lbl_charm.SetLabel(_("charm failed."))
-            wx.MessageBox(error or _("charm failed."), _("SimNIBS error"), wx.ICON_ERROR)
-            return
-
         self.gauge_charm.SetValue(100)
         self.lbl_charm.SetLabel(_("Head model complete."))
-
-        # Update m2m path so the Simulation section can use it
-        self._m2m_path = m2m_dir
-        self.txt_m2m.SetValue(m2m_dir)
-        self._save_path(_KEY_M2M_DIR, m2m_dir)
-        self.btn_run_sim.Enable(True)
-
-        # Let the user choose which NIfTI to open in the volume viewer
-        dlg = wx.FileDialog(
-            self,
-            message=_("Select the NIfTI file to open in the volume viewer"),
-            defaultDir=m2m_dir,
-            wildcard=_("NIfTI (*.nii;*.nii.gz)|*.nii;*.nii.gz|All files (*.*)|*.*"),
-            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
-        )
-        if dlg.ShowModal() == wx.ID_OK:
-            filepath = utils.decode(dlg.GetPath(), const.FS_ENCODE)
-            Publisher.sendMessage("Open other files", filepath=filepath)
-        dlg.Destroy()
+        if m2m_dir:
+            self._m2m_path = m2m_dir
+            self.txt_m2m.SetValue(m2m_dir)
+            self._save_path(_KEY_M2M_DIR, m2m_dir)
+            self.btn_run_sim.Enable(True)
 
     def OnLoadTissueSurfaces(self, _evt):
         """
@@ -835,15 +799,6 @@ class InnerTaskPanel(wx.Panel):
         dlg.Destroy()
 
     def _load_tissue_surfaces(self, labels_nii: str) -> None:
-        """
-        NIfTI pipeline:
-          1. Read the selected tissue-label NIfTI.
-          2. Discover unique non-zero integer labels present in the volume.
-          3. Look up each label's name via the SimNIBS colour LUT.
-          4. For each label: save a binary mask to a temp file, import it
-             into InVesalius via pubsub ("Import Nifti mask"), then create
-             a VTK surface via pubsub ("Create surface from index").
-        """
         import nibabel as nib
         import numpy as np
 
@@ -872,8 +827,6 @@ class InnerTaskPanel(wx.Panel):
 
         for label in present:
             name, _colour = info[label]
-            mask_name = f"{name}"
-
             binary = (data == label).astype(np.uint8) * 255
             mask_img = nib.Nifti1Image(binary, nii.affine, nii.header)
 
@@ -881,10 +834,10 @@ class InnerTaskPanel(wx.Panel):
                 tmp = fh.name
             try:
                 nib.save(mask_img, tmp)
-                Publisher.sendMessage("Import Nifti mask", filepath=tmp, mask_name=mask_name)
+                Publisher.sendMessage("Import Nifti mask", filepath=tmp, mask_name=name)
                 proj = prj.Project()
                 idx = max(proj.mask_dict.keys())
-                created.append((idx, mask_name))
+                created.append((idx, name))
             except Exception as exc:
                 wx.MessageBox(
                     _("Could not import mask for label {} ({}):\n{}").format(label, name, exc),
@@ -920,6 +873,45 @@ class InnerTaskPanel(wx.Panel):
             }
             Publisher.sendMessage("Create surface from index", surface_parameters=surface_params)
 
+        self._surface_names = [name for _, name in created]
+        self._refresh_surface_dropdown()
+
+    def _on_coil_pose(self, coord):
+        """Store the latest coil pose broadcast by the navigation module."""
+        import numpy as np
+        from scipy.spatial.transform import Rotation
+
+        if not coord or len(coord) < 6:
+            return
+        x, y, z, rx, ry, rz = coord
+        R = Rotation.from_euler("xyz", [rx, ry, rz], degrees=True).as_matrix()
+        mat = np.eye(4)
+        mat[:3, :3] = R
+        mat[:3, 3] = [x, y, z]
+        self._matsimnibs = mat.tolist()
+
+    def OnLockPose(self, _evt):
+        import numpy as np
+
+        if self._matsimnibs is None:
+            wx.MessageBox(
+                _("No coil pose received yet.\nThe navigation module must send a coil pose first."),
+                _("No pose"),
+                wx.ICON_WARNING,
+            )
+            return
+        self._pose_locked = True
+        self._refresh_mat_display(np.array(self._matsimnibs))
+
+    def _refresh_mat_display(self, mat=None):
+        import numpy as np
+
+        m = mat if mat is not None else np.eye(4)
+        lines = [
+            f"[ {m[r, 0]:7.3f}  {m[r, 1]:7.3f}  {m[r, 2]:7.3f}  {m[r, 3]:8.2f} ]" for r in range(4)
+        ]
+        self.txt_mat.SetValue("\n".join(lines))
+
     def OnRunSimulation(self, _evt):
         m2m_path = self.txt_m2m.GetValue().strip()
         out_dir = self.txt_sim_out.GetValue().strip()
@@ -939,59 +931,90 @@ class InnerTaskPanel(wx.Panel):
             )
             return
 
-        print(f"[SimNIBS] TODO: run simulation m2m={m2m_path!r}, coil={coil!r}, didt={didt}")
+        if not self._relay.connected:
+            wx.MessageBox(
+                _(
+                    "Not connected to the SimNIBS relay server.\n"
+                    "Please enter the relay URL and click Connect."
+                ),
+                _("Not connected"),
+                wx.ICON_WARNING,
+            )
+            return
+
+        payload: dict = {
+            "m2m_dir": m2m_path,
+            "output_dir": out_dir,
+            "coil": coil,
+            "didt": didt,
+        }
+        if self._matsimnibs is not None:
+            payload["matsimnibs"] = self._matsimnibs
+
+        sent = self._relay.send("SimNIBS: Run simulation", payload)
+        if not sent:
+            wx.MessageBox(
+                _("Failed to send command to the SimNIBS server."), _("Error"), wx.ICON_ERROR
+            )
+            return
+
+        self._running = "sim"
         self.btn_run_sim.Enable(False)
         self.btn_cancel_sim.Enable(True)
         self.gauge_sim.SetValue(0)
-        self.lbl_sim.SetLabel(_("Simulation not yet connected — see TODO in OnRunSimulation."))
+        self.lbl_sim.SetLabel(_("Sent to SimNIBS server…"))
 
     def OnCancelSimulation(self, _evt):
-        # TODO: call self._runner.cancel()
+        self._relay.send("SimNIBS: Cancel simulation", {})
+        self._running = None
         self.btn_run_sim.Enable(True)
         self.btn_cancel_sim.Enable(False)
-        self.lbl_sim.SetLabel(_("Cancelled."))
-
-    def _sim_progress(self, message, percent):
-        self.gauge_sim.SetValue(int(percent or 0))
-        self.lbl_sim.SetLabel(message)
-
-    def _sim_done(self, success, error, output_msh):
-        self.btn_run_sim.Enable(True)
-        self.btn_cancel_sim.Enable(False)
-        if success and output_msh:
-            self.gauge_sim.SetValue(100)
-            self.lbl_sim.SetLabel(_("Simulation done. Loading E-field …"))
-            Publisher.sendMessage(TOPIC_LOAD_RESULT, result_msh=output_msh)
-        else:
-            self.gauge_sim.SetValue(0)
-            self.lbl_sim.SetLabel(_("Simulation failed."))
-            wx.MessageBox(error or _("SimNIBS failed."), _("Simulation error"), wx.ICON_ERROR)
-
-    # pubsub callbacks (fired by simnibs_handler)
+        self.lbl_sim.SetLabel(_("Cancel requested."))
 
     def _on_surfaces_loaded(self, surfaces):
         self.btn_run_sim.Enable(True)
         self.lbl_sim.SetLabel(_("Head surfaces loaded."))
 
     def _on_efield_loaded(self, stats):
-        max_E = stats.get("max_E_Vm", 0.0)
-        self.lbl_sim.SetLabel(f"E-field loaded. Peak: {max_E:.1f} V/m")
-        self.gauge_sim.SetValue(0)
+        self._running = None
+        result_msh = stats.get("result_msh", "")
+        label = os.path.basename(result_msh) if result_msh else _("Simulation complete.")
+        self.lbl_sim.SetLabel(label)
+        self.gauge_sim.SetValue(100)
+        self.btn_run_sim.Enable(True)
+        self.btn_cancel_sim.Enable(False)
 
     def _on_progress(self, message, percent):
-        self.gauge_sim.SetValue(int(percent or 0))
-        self.lbl_sim.SetLabel(message)
+        if self._running == "charm":
+            self.gauge_charm.SetValue(int(percent or 0))
+            self.lbl_charm.SetLabel(message)
+        else:
+            self.gauge_sim.SetValue(int(percent or 0))
+            self.lbl_sim.SetLabel(message)
 
     def _on_error(self, message):
+        self._running = None
+        self.gauge_charm.SetValue(0)
         self.gauge_sim.SetValue(0)
+        self.lbl_charm.SetLabel(_("Error."))
         self.lbl_sim.SetLabel(f"Error: {message}")
+        self.btn_run_charm.Enable(True)
+        self.btn_cancel_charm.Enable(False)
+        self.btn_run_sim.Enable(True)
+        self.btn_cancel_sim.Enable(False)
         wx.MessageBox(message, _("SimNIBS error"), wx.ICON_ERROR | wx.OK)
 
-    def OnToggleGM(self, evt):
-        Publisher.sendMessage(TOPIC_SET_VISIBILITY, name="gm", visible=evt.IsChecked())
+    def OnSurfaceSelect(self, _evt):
+        selected = self.combo_surface.GetStringSelection()
+        for name in self._surface_names:
+            Publisher.sendMessage(TOPIC_SET_VISIBILITY, name=name, visible=(name == selected))
 
-    def OnToggleSkin(self, evt):
-        Publisher.sendMessage(TOPIC_SET_VISIBILITY, name="skin", visible=evt.IsChecked())
+    def _refresh_surface_dropdown(self) -> None:
+        self.combo_surface.Clear()
+        for name in self._surface_names:
+            self.combo_surface.Append(name)
+        if self._surface_names:
+            self.combo_surface.SetSelection(0)
 
     def OnColormap(self, _evt):
         Publisher.sendMessage(TOPIC_SET_COLORMAP, colormap=self.combo_cmap.GetValue())
