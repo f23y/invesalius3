@@ -359,33 +359,32 @@ class InnerTaskPanel(wx.Panel):
         )
         sz_hm.Add(self.chk_forcerun, 0, wx.LEFT | wx.BOTTOM, 2)
 
-        self.radio_qsform = wx.RadioBox(
-            self,
-            -1,
-            _("qform/sform mismatch"),
-            choices=[
-                _("Do nothing"),
-                _("Force qform"),
-                _("Force sform"),
-            ],
-            majorDimension=1,
-            style=wx.RA_SPECIFY_ROWS,
-        )
-        self.radio_qsform.SetSelection(1)
-        self.radio_qsform.SetToolTip(
+        self.chk_force_qform = wx.CheckBox(self, -1, _("Force qform (--forceqform)"))
+        self.chk_force_qform.SetValue(True)
+        self.chk_force_qform.SetToolTip(
             _(
-                "charm requires the qform and sform in the T1 NIfTI header to match.\n\n"
-                "'Force qform' replaces sform with qform and is what charm itself\n"
-                "recommends when it reports a qform/sform mismatch (the common case).\n\n"
-                "'Force sform' replaces qform with sform (and strips shears); only use\n"
-                "this if the qform code is unknown/invalid.\n\n"
-                "Important: if 'Force qform' is used, the original sform is overwritten.\n"
-                "Neuronavigation software must then be set up with the SimNIBS-processed\n"
-                "T1.nii.gz from the m2m_<subjectID> folder, not the original input MRI —\n"
+                "Replace sform with qform in the T1 NIfTI header.\n"
+                "This is what charm itself recommends when it reports a\n"
+                "qform/sform mismatch (the common case).\n\n"
+                "Important: this overwrites the original sform. Neuronavigation\n"
+                "software must then be set up with the SimNIBS-processed T1.nii.gz\n"
+                "from the m2m_<subjectID> folder, not the original input MRI —\n"
                 "otherwise coil pose import/export will be misaligned."
             )
         )
-        sz_hm.Add(self.radio_qsform, 0, wx.EXPAND | wx.LEFT | wx.BOTTOM, 2)
+        self.chk_force_qform.Bind(wx.EVT_CHECKBOX, self.OnForceQform)
+        sz_hm.Add(self.chk_force_qform, 0, wx.LEFT | wx.BOTTOM, 2)
+
+        self.chk_force_sform = wx.CheckBox(self, -1, _("Force sform (--forcesform)"))
+        self.chk_force_sform.SetToolTip(
+            _(
+                "Replace qform with sform in the T1 NIfTI header (strips shears).\n"
+                "Only needed if the qform code is unknown/invalid — charm\n"
+                "recommends Force qform for the common mismatch case instead."
+            )
+        )
+        self.chk_force_sform.Bind(wx.EVT_CHECKBOX, self.OnForceSform)
+        sz_hm.Add(self.chk_force_sform, 0, wx.LEFT | wx.BOTTOM, 2)
 
         row_hm = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_run_charm = wx.Button(self, -1, _("Run head model"), size=wx.Size(110, -1))
@@ -398,7 +397,7 @@ class InnerTaskPanel(wx.Panel):
         sz_hm.Add(row_hm, 0, wx.EXPAND | wx.ALL, 2)
 
         self.gauge_charm = wx.Gauge(self, -1, 100)
-        self.lbl_charm = wx.StaticText(self, -1, _("Ready."))
+        self.lbl_charm = wx.StaticText(self, -1, _("When ready: "))
         sz_hm.Add(self.gauge_charm, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
         sz_hm.Add(self.lbl_charm, 0, wx.LEFT | wx.BOTTOM, 2)
 
@@ -683,6 +682,14 @@ class InnerTaskPanel(wx.Panel):
         if path:
             self.txt_coil.SetValue(path)
 
+    def OnForceQform(self, _evt):
+        if self.chk_force_qform.GetValue():
+            self.chk_force_sform.SetValue(False)
+
+    def OnForceSform(self, _evt):
+        if self.chk_force_sform.GetValue():
+            self.chk_force_qform.SetValue(False)
+
     def OnRunCharm(self, _evt):
         subject = self.txt_subject.GetValue().strip()
         t1 = self.txt_t1.GetValue().strip()
@@ -710,9 +717,8 @@ class InnerTaskPanel(wx.Panel):
 
         subject_dir = os.path.join(outdir, f"m2m_{subject}")
         forcerun = self.chk_forcerun.GetValue()
-        qsform_choice = self.radio_qsform.GetSelection()
-        force_qform = qsform_choice == 1
-        force_sform = qsform_choice == 2
+        force_qform = self.chk_force_qform.GetValue()
+        force_sform = self.chk_force_sform.GetValue()
 
         msg = _(
             "charm will create the following folder on the SimNIBS server:\n\n"
