@@ -160,6 +160,7 @@ class InnerTaskPanel(wx.Panel):
         self._matsimnibs = None
         self._running = None
         self._surface_names: list[str] = []
+        self._mask_index_by_name: dict[str, int] = {}
 
         self._subscribe()
         self._build_ui()
@@ -694,6 +695,7 @@ class InnerTaskPanel(wx.Panel):
             Publisher.sendMessage("Create surface from index", surface_parameters=surface_params)
 
         self._surface_names = [name for _, name in created]
+        self._mask_index_by_name = {name: mask_idx for mask_idx, name in created}
         self._refresh_surface_dropdown()
 
     def _on_coil_pose(self, coord):
@@ -809,9 +811,28 @@ class InnerTaskPanel(wx.Panel):
         wx.MessageBox(message, _("SimNIBS error"), wx.ICON_ERROR | wx.OK)
 
     def OnSurfaceSelect(self, _evt):
+        import invesalius.project as prj
+
         selected = self.combo_surface.GetStringSelection()
+        surface_dict = prj.Project().surface_dict
+        index_by_name = {surface.name: index for index, surface in surface_dict.items()}
+
         for name in self._surface_names:
-            Publisher.sendMessage(TOPIC_SET_VISIBILITY, name=name, visible=(name == selected))
+            index = index_by_name.get(name)
+            if index is not None:
+                Publisher.sendMessage("Show surface", index=index, visibility=(name == selected))
+
+        for name in self._surface_names:
+            if name == selected:
+                continue
+            mask_index = self._mask_index_by_name.get(name)
+            if mask_index is not None:
+                Publisher.sendMessage("Show mask", index=mask_index, value=False)
+
+        selected_mask_index = self._mask_index_by_name.get(selected)
+        if selected_mask_index is not None:
+            Publisher.sendMessage("Change mask selected", index=selected_mask_index)
+            Publisher.sendMessage("Show mask", index=selected_mask_index, value=True)
 
     def _refresh_surface_dropdown(self) -> None:
         self.combo_surface.Clear()
