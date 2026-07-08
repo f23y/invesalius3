@@ -22,9 +22,7 @@ import os
 import shutil
 import sys
 import tempfile
-import threading
 
-import socketio as sio_module
 import wx
 
 import invesalius.constants as const
@@ -40,11 +38,7 @@ _KEY_OUTPUT_DIR = "simnibs_last_output_dir"
 _KEY_COIL_FILE = "simnibs_last_coil_file"
 _KEY_T1_FILE = "simnibs_last_t1_file"
 _KEY_T2_FILE = "simnibs_last_t2_file"
-_KEY_RELAY_URL = "simnibs_relay_url"
 
-_DEFAULT_RELAY_URL = "http://127.0.0.1:5000"
-
-# Pubsub topic strings
 TOPIC_LOAD_SURFACES = "Load SimNIBS surfaces"
 TOPIC_LOAD_RESULT = "Load SimNIBS result"
 TOPIC_REMOVE_SURFACES = "Remove SimNIBS surfaces"
@@ -56,9 +50,7 @@ TOPIC_SURFACES_LOADED = "SimNIBS surfaces loaded"
 TOPIC_EFIELD_LOADED = "SimNIBS efield loaded"
 TOPIC_PROGRESS = "SimNIBS progress"
 TOPIC_ERROR = "SimNIBS error"
-TOPIC_CHARM_DONE = "SimNIBS charm done"
-TOPIC_RELAY_CONNECTED = "SimNIBS relay connected"
-TOPIC_RELAY_DISCONNECTED = "SimNIBS relay disconnected"
+TOPIC_CHARM_DONE = "Charm done"
 
 # Navigation module publishes current coil pose on this topic.
 TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
@@ -139,118 +131,6 @@ def _label_info(present_labels: list) -> dict:
     return result
 
 
-class SimNIBSRelayClient:
-    """Socket.IO client that bridges the InVesalius panel to the SimNIBS server.
-
-    Emits commands on ``from_neuronavigation`` and listens on
-    ``to_neuronavigation`` for responses from the SimNIBS processing server.
-    Incoming messages are dispatched to InVesalius pubsub via wx.CallAfter so
-    all UI updates happen on the wx main thread.
-    """
-
-    def __init__(self) -> None:
-        self._sio: sio_module.Client | None = None
-        self._thread: threading.Thread | None = None
-        self._url = ""
-        self.connected = False
-
-    def connect(self, url: str) -> None:
-        if self._thread and self._thread.is_alive():
-            self.disconnect()
-        self._url = url
-        self._thread = threading.Thread(target=self._run, daemon=True, name="simnibs-relay-client")
-        self._thread.start()
-
-    def disconnect(self) -> None:
-        if self._sio:
-            try:
-                self._sio.disconnect()
-            except Exception:
-                pass
-
-    def send(self, topic: str, data: dict) -> bool:
-        """Emit a command to the SimNIBS server via the relay.
-
-        Returns True if the emit succeeded, False if not connected.
-        """
-        if not self._sio or not self.connected:
-            log.warning("SimNIBSRelayClient: cannot send '%s' — not connected", topic)
-            return False
-        try:
-            self._sio.emit("from_neuronavigation", {"topic": topic, "data": data})
-            return True
-        except Exception as exc:
-            log.error("SimNIBSRelayClient: emit failed for '%s': %s", topic, exc)
-            return False
-
-    def _run(self) -> None:
-        self._sio = sio_module.Client(
-            logger=False,
-            engineio_logger=False,
-            reconnection=True,
-            reconnection_attempts=0,
-            reconnection_delay=1,
-            reconnection_delay_max=10,
-        )
-
-        @self._sio.event
-        def connect():
-            self.connected = True
-            log.info("SimNIBSRelayClient: connected to %s", self._url)
-            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_CONNECTED)
-
-        @self._sio.event
-        def disconnect():
-            self.connected = False
-            log.warning("SimNIBSRelayClient: disconnected")
-            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_DISCONNECTED)
-
-        @self._sio.event
-        def connect_error(data):
-            self.connected = False
-            log.warning("SimNIBSRelayClient: connection error: %s", data)
-            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_DISCONNECTED)
-
-        @self._sio.on("to_neuronavigation")
-        def on_msg(msg):
-            if isinstance(msg, dict) and "topic" in msg:
-                wx.CallAfter(self._dispatch, msg["topic"], msg.get("data", {}))
-            else:
-                log.warning("SimNIBSRelayClient: unexpected message shape: %s", msg)
-
-        try:
-            self._sio.connect(
-                self._url,
-                transports=["websocket", "polling"],
-                wait_timeout=10,
-            )
-            self._sio.wait()
-        except Exception as exc:
-            log.warning("SimNIBSRelayClient: %s", exc)
-            self.connected = False
-            wx.CallAfter(Publisher.sendMessage, TOPIC_RELAY_DISCONNECTED)
-
-    @staticmethod
-    def _dispatch(topic: str, data: dict) -> None:
-        """Convert relay messages to InVesalius pubsub events (main thread)."""
-        if topic == "SimNIBS progress":
-            Publisher.sendMessage(
-                TOPIC_PROGRESS,
-                message=data.get("message", ""),
-                percent=data.get("percent", 0),
-            )
-        elif topic == "Charm done":
-            Publisher.sendMessage(TOPIC_CHARM_DONE, m2m_dir=data.get("m2m_dir", ""))
-        elif topic == "SimNIBS efield loaded":
-            Publisher.sendMessage(TOPIC_EFIELD_LOADED, stats=data)
-        elif topic == "SimNIBS error":
-            Publisher.sendMessage(TOPIC_ERROR, message=data.get("message", "Unknown error"))
-        elif topic == "Open other files":
-            filepath = data.get("filepath", "")
-            if filepath:
-                Publisher.sendMessage("Open other files", filepath=filepath)
-
-
 class TaskPanel(wx.ScrolledWindow):
     def __init__(self, parent):
         wx.ScrolledWindow.__init__(self, parent, style=wx.TAB_TRAVERSAL)
@@ -269,14 +149,6 @@ class TaskPanel(wx.ScrolledWindow):
 
 
 class InnerTaskPanel(wx.Panel):
-    """
-    Four collapsible sections:
-      0. Relay Server  — connect to the SimNIBS processing server
-      1. Head Model    — charm segmentation inputs
-      2. Simulation    — coil / pose / run controls
-      3. E-field View  — overlay / colormap / threshold
-    """
-
     def __init__(self, parent):
         wx.Panel.__init__(self, parent)
 
@@ -285,9 +157,8 @@ class InnerTaskPanel(wx.Panel):
         self.session = ses.Session()
         self._m2m_path = None
         self._pose_locked = False
-        self._matsimnibs = None  # 4×4 matrix as nested list, from navigation
-        self._running = None  # "charm" | "sim" | None — tracks active job
-        self._relay = SimNIBSRelayClient()
+        self._matsimnibs = None
+        self._running = None
         self._surface_names: list[str] = []
 
         self._subscribe()
@@ -301,22 +172,8 @@ class InnerTaskPanel(wx.Panel):
         Publisher.subscribe(self._on_error, TOPIC_ERROR)
         Publisher.subscribe(self._on_charm_done, TOPIC_CHARM_DONE)
         Publisher.subscribe(self._on_coil_pose, TOPIC_COIL_POSE)
-        Publisher.subscribe(self._on_relay_connected, TOPIC_RELAY_CONNECTED)
-        Publisher.subscribe(self._on_relay_disconnected, TOPIC_RELAY_DISCONNECTED)
 
     def _build_ui(self):
-        # RELAY SERVER
-        box_relay = wx.StaticBox(self, -1, _("SimNIBS Relay Server"))
-        sz_relay = wx.StaticBoxSizer(box_relay, wx.HORIZONTAL)
-        self.txt_relay = wx.TextCtrl(self, -1, _DEFAULT_RELAY_URL)
-        self.btn_connect = wx.Button(self, -1, _("Connect"), size=wx.Size(80, -1))
-        self.lbl_relay = wx.StaticText(self, -1, _("Disconnected"))
-        self.lbl_relay.SetForegroundColour(wx.Colour(180, 0, 0))
-        self.btn_connect.Bind(wx.EVT_BUTTON, self.OnConnect)
-        sz_relay.Add(self.txt_relay, 1, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
-        sz_relay.Add(self.btn_connect, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
-        sz_relay.Add(self.lbl_relay, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
-
         # HEAD MODEL
         box_hm = wx.StaticBox(self, -1, _("Head Model (charm)"))
         sz_hm = wx.StaticBoxSizer(box_hm, wx.VERTICAL)
@@ -540,7 +397,6 @@ class InnerTaskPanel(wx.Panel):
 
         # outer sizer
         main = wx.BoxSizer(wx.VERTICAL)
-        main.Add(sz_relay, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_hm, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_sim, 0, wx.EXPAND | wx.ALL, 5)
         main.Add(sz_ef, 0, wx.EXPAND | wx.ALL, 5)
@@ -548,8 +404,6 @@ class InnerTaskPanel(wx.Panel):
         self.Layout()
 
     def _restore_paths(self):
-        relay_url = self.session.GetConfig(_KEY_RELAY_URL, _DEFAULT_RELAY_URL)
-        self.txt_relay.SetValue(relay_url)
         self.txt_m2m.SetValue(self.session.GetConfig(_KEY_M2M_DIR, ""))
         self.txt_sim_out.SetValue(self.session.GetConfig(_KEY_OUTPUT_DIR, ""))
         self.txt_coil.SetValue(self.session.GetConfig(_KEY_COIL_FILE, ""))
@@ -557,8 +411,6 @@ class InnerTaskPanel(wx.Panel):
         self.txt_t2.SetValue(self.session.GetConfig(_KEY_T2_FILE, ""))
         if self.session.GetConfig(_KEY_M2M_DIR, ""):
             self.btn_run_sim.Enable(True)
-        if relay_url:
-            self._relay.connect(relay_url)
 
     def _save_path(self, key, value):
         self.session.SetConfig(key, value)
@@ -616,26 +468,6 @@ class InnerTaskPanel(wx.Panel):
             path = utils.decode(path, const.FS_ENCODE)
             self._save_path(session_key, path)
         return path
-
-    def OnConnect(self, _evt):
-        if self._relay.connected:
-            self._relay.disconnect()
-        else:
-            url = self.txt_relay.GetValue().strip() or _DEFAULT_RELAY_URL
-            self._save_path(_KEY_RELAY_URL, url)
-            self._relay.connect(url)
-
-    def _on_relay_connected(self):
-        self.lbl_relay.SetLabel(_("Connected"))
-        self.lbl_relay.SetForegroundColour(wx.Colour(0, 150, 0))
-        self.btn_connect.SetLabel(_("Disconnect"))
-        self.Layout()
-
-    def _on_relay_disconnected(self):
-        self.lbl_relay.SetLabel(_("Disconnected"))
-        self.lbl_relay.SetForegroundColour(wx.Colour(180, 0, 0))
-        self.btn_connect.SetLabel(_("Connect"))
-        self.Layout()
 
     def OnBrowseT1(self, _evt):
         path = self._browse_file(
@@ -704,17 +536,6 @@ class InnerTaskPanel(wx.Panel):
             )
             return
 
-        if not self._relay.connected:
-            wx.MessageBox(
-                _(
-                    "Not connected to the SimNIBS relay server.\n"
-                    "Please enter the relay URL and click Connect."
-                ),
-                _("Not connected"),
-                wx.ICON_WARNING,
-            )
-            return
-
         subject_dir = os.path.join(outdir, f"m2m_{subject}")
         forcerun = self.chk_forcerun.GetValue()
         force_qform = self.chk_force_qform.GetValue()
@@ -745,21 +566,14 @@ class InnerTaskPanel(wx.Panel):
             return
 
         mri_files = [t1] + ([t2] if t2 else [])
-        sent = self._relay.send(
+        Publisher.sendMessage(
             "SimNIBS: Run charm",
-            {
-                "subject_dir": subject_dir,
-                "mri_files": mri_files,
-                "forcerun": forcerun,
-                "force_qform": force_qform,
-                "force_sform": force_sform,
-            },
+            subject_dir=subject_dir,
+            mri_files=mri_files,
+            forcerun=forcerun,
+            force_qform=force_qform,
+            force_sform=force_sform,
         )
-        if not sent:
-            wx.MessageBox(
-                _("Failed to send command to the SimNIBS server."), _("Error"), wx.ICON_ERROR
-            )
-            return
 
         self._running = "charm"
         self.btn_run_charm.Enable(False)
@@ -768,7 +582,7 @@ class InnerTaskPanel(wx.Panel):
         self.lbl_charm.SetLabel(_("Sent to SimNIBS server…"))
 
     def OnCancelCharm(self, _evt):
-        self._relay.send("SimNIBS: Cancel charm", {})
+        Publisher.sendMessage("SimNIBS: Cancel charm")
         self._running = None
         self.btn_run_charm.Enable(True)
         self.btn_cancel_charm.Enable(False)
@@ -937,17 +751,6 @@ class InnerTaskPanel(wx.Panel):
             )
             return
 
-        if not self._relay.connected:
-            wx.MessageBox(
-                _(
-                    "Not connected to the SimNIBS relay server.\n"
-                    "Please enter the relay URL and click Connect."
-                ),
-                _("Not connected"),
-                wx.ICON_WARNING,
-            )
-            return
-
         payload: dict = {
             "m2m_dir": m2m_path,
             "output_dir": out_dir,
@@ -957,12 +760,7 @@ class InnerTaskPanel(wx.Panel):
         if self._matsimnibs is not None:
             payload["matsimnibs"] = self._matsimnibs
 
-        sent = self._relay.send("SimNIBS: Run simulation", payload)
-        if not sent:
-            wx.MessageBox(
-                _("Failed to send command to the SimNIBS server."), _("Error"), wx.ICON_ERROR
-            )
-            return
+        Publisher.sendMessage("SimNIBS: Run simulation", **payload)
 
         self._running = "sim"
         self.btn_run_sim.Enable(False)
@@ -971,7 +769,7 @@ class InnerTaskPanel(wx.Panel):
         self.lbl_sim.SetLabel(_("Sent to SimNIBS server…"))
 
     def OnCancelSimulation(self, _evt):
-        self._relay.send("SimNIBS: Cancel simulation", {})
+        Publisher.sendMessage("SimNIBS: Cancel simulation")
         self._running = None
         self.btn_run_sim.Enable(True)
         self.btn_cancel_sim.Enable(False)
