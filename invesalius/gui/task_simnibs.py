@@ -200,10 +200,10 @@ class InnerTaskPanel(wx.Panel):
         g1.Add(wx.StaticText(self, -1, _("Subject ID:")), 0, wx.ALIGN_CENTER_VERTICAL)
         g1.Add(self.txt_subject, 1, wx.EXPAND)
         g1.AddSpacer(0)
-        g1.Add(wx.StaticText(self, -1, _("MRI file 1:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g1.Add(wx.StaticText(self, -1, _("T1-weighted:")), 0, wx.ALIGN_CENTER_VERTICAL)
         g1.Add(self.txt_t1, 1, wx.EXPAND)
         g1.Add(btn_t1, 0)
-        g1.Add(wx.StaticText(self, -1, _("MRI file 2:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g1.Add(wx.StaticText(self, -1, _("T2-weighted:")), 0, wx.ALIGN_CENTER_VERTICAL)
         g1.Add(self.txt_t2, 1, wx.EXPAND)
         g1.Add(btn_t2, 0)
         g1.Add(wx.StaticText(self, -1, _("Output dir:")), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -490,7 +490,7 @@ class InnerTaskPanel(wx.Panel):
         path = self._browse_file(
             _("NIfTI (*.nii;*.nii.gz)|*.nii;*.nii.gz|All files (*.*)|*.*"),
             _KEY_T1_FILE,
-            _("Select MRI file 1"),
+            _("Select T1-weighted image"),
         )
         if path:
             self.txt_t1.SetValue(path)
@@ -499,7 +499,7 @@ class InnerTaskPanel(wx.Panel):
         path = self._browse_file(
             _("NIfTI (*.nii;*.nii.gz)|*.nii;*.nii.gz|All files (*.*)|*.*"),
             _KEY_T2_FILE,
-            _("Select MRI file 2"),
+            _("Select T2-weighted image"),
         )
         if path:
             self.txt_t2.SetValue(path)
@@ -547,7 +547,7 @@ class InnerTaskPanel(wx.Panel):
 
         if not subject or not t1 or not outdir:
             wx.MessageBox(
-                _("Please fill in Subject ID, MRI file 1 path, and output folder."),
+                _("Please fill in Subject ID, T1-weighted image path, and output folder."),
                 _("Missing input"),
                 wx.ICON_WARNING,
             )
