@@ -38,6 +38,7 @@ _KEY_OUTPUT_DIR = "simnibs_last_output_dir"
 _KEY_COIL_FILE = "simnibs_last_coil_file"
 _KEY_T1_FILE = "simnibs_last_t1_file"
 _KEY_T2_FILE = "simnibs_last_t2_file"
+_KEY_EFIELD_FILE = "simnibs_last_efield_file"
 
 TOPIC_LOAD_SURFACES = "Load SimNIBS surfaces"
 TOPIC_LOAD_RESULT = "Load SimNIBS result"
@@ -51,8 +52,6 @@ TOPIC_EFIELD_LOADED = "SimNIBS efield loaded"
 TOPIC_PROGRESS = "SimNIBS progress"
 TOPIC_ERROR = "SimNIBS error"
 TOPIC_CHARM_DONE = "Charm done"
-
-# Navigation module publishes current coil pose on this topic.
 TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
 
 
@@ -161,6 +160,10 @@ class InnerTaskPanel(wx.Panel):
         self._running = None
         self._surface_names: list[str] = []
         self._mask_index_by_name: dict[str, int] = {}
+
+        from invesalius.data.simnibs_efield import SimnibsEfieldRenderer
+
+        self._efield_renderer = SimnibsEfieldRenderer()
 
         self._subscribe()
         self._build_ui()
@@ -352,21 +355,34 @@ class InnerTaskPanel(wx.Panel):
         row_surf.Add(self.combo_surface, 1)
         sz_ef.Add(row_surf, 0, wx.EXPAND | wx.ALL, 2)
 
+        self.btn_load_efield = wx.Button(self, -1, _("Load E-field result…"))
+        self.btn_load_efield.SetToolTip(
+            _(
+                "Load an E-field surface (.vtk/.vtp) produced by the SimNIBS\n"
+                "server and overlay it, coloured by field magnitude, on the 3D view."
+            )
+        )
+        self.btn_load_efield.Bind(wx.EVT_BUTTON, self.OnLoadEfieldResult)
+        sz_ef.Add(self.btn_load_efield, 0, wx.ALL, 2)
+
         row_cmap = wx.BoxSizer(wx.HORIZONTAL)
         row_cmap.Add(
             wx.StaticText(self, -1, _("Colormap:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
         )
+        cmap_choices = list(const.MEP_COLORMAP_DEFINITIONS.keys())
         self.combo_cmap = wx.ComboBox(
             self,
             -1,
-            size=wx.Size(90, -1),
-            choices=["hot", "jet", "cool", "rainbow"],
+            size=wx.Size(150, -1),
+            choices=cmap_choices,
             style=wx.CB_DROPDOWN | wx.CB_READONLY,
         )
-        self.combo_cmap.SetSelection(0)
+        self.combo_cmap.SetStringSelection(
+            "Viridis" if "Viridis" in cmap_choices else cmap_choices[0]
+        )
         self.combo_cmap.Bind(wx.EVT_COMBOBOX, self.OnColormap)
-        row_cmap.Add(self.combo_cmap, 0)
-        sz_ef.Add(row_cmap, 0, wx.ALL, 2)
+        row_cmap.Add(self.combo_cmap, 1)
+        sz_ef.Add(row_cmap, 0, wx.EXPAND | wx.ALL, 2)
 
         row_op = wx.BoxSizer(wx.HORIZONTAL)
         row_op.Add(
@@ -781,9 +797,8 @@ class InnerTaskPanel(wx.Panel):
         self.btn_run_sim.Enable(True)
         self.lbl_sim.SetLabel(_("Head surfaces loaded."))
 
-    def _on_efield_loaded(self, stats):
+    def _on_efield_loaded(self, result_msh):
         self._running = None
-        result_msh = stats.get("result_msh", "")
         label = os.path.basename(result_msh) if result_msh else _("Simulation complete.")
         self.lbl_sim.SetLabel(label)
         self.gauge_sim.SetValue(100)
@@ -849,6 +864,15 @@ class InnerTaskPanel(wx.Panel):
 
     def OnThreshold(self, _evt):
         Publisher.sendMessage(TOPIC_SET_THRESHOLD, threshold_pct=self.spin_threshold.GetValue())
+
+    def OnLoadEfieldResult(self, _evt):
+        path = self._browse_file(
+            _("E-field surface (*.vtk;*.vtp)|*.vtk;*.vtp|All files (*.*)|*.*"),
+            _KEY_EFIELD_FILE,
+            _("Select E-field surface (.vtk/.vtp)"),
+        )
+        if path:
+            Publisher.sendMessage(TOPIC_LOAD_RESULT, filepath=path)
 
     def OnRemove(self, _evt):
         Publisher.sendMessage(TOPIC_REMOVE_SURFACES)
