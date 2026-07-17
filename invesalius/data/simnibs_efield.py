@@ -21,6 +21,8 @@ import logging
 import os
 
 from vtkmodules.vtkCommonCore import vtkLookupTable
+from vtkmodules.vtkCommonTransforms import vtkTransform
+from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 from vtkmodules.vtkIOLegacy import vtkPolyDataReader
 from vtkmodules.vtkIOXML import vtkXMLPolyDataReader
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
@@ -132,6 +134,9 @@ class SimnibsEfieldRenderer:
         actor = vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetOpacity(self._opacity)
+
+        actor.ForceOpaqueOn()
+        actor.GetProperty().SetInterpolationToFlat()
         return actor, vmin, vmax
 
     def _apply_lut(self) -> None:
@@ -162,9 +167,24 @@ def _read_polydata(path: str):
     reader.SetFileName(path)
     reader.Update()
     polydata = reader.GetOutput()
-    if polydata is None or polydata.GetNumberOfPoints() == 0:
+    import invesalius.data.slice_ as sl
+
+    slic = sl.Slice()
+    affine, affine_vtk, _ = slic.get_world_to_invesalius_vtk_affine(inverse=False)
+
+    polydata_transform = vtkTransform()
+    polydata_transform.PostMultiply()
+    polydata_transform.Concatenate(affine_vtk)
+
+    transformFilter = vtkTransformPolyDataFilter()
+    transformFilter.SetTransform(polydata_transform)
+    transformFilter.SetInputData(polydata)
+    transformFilter.Update()
+
+    out = transformFilter.GetOutput()
+    if out is None or out.GetNumberOfPoints() == 0:
         raise ValueError("surface file is empty or could not be read")
-    return polydata
+    return out
 
 
 def _select_scalar_array(polydata):

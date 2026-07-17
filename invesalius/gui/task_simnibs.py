@@ -23,11 +23,14 @@ import shutil
 import sys
 import tempfile
 
+import numpy as np
 import wx
+from scipy.spatial.transform import Rotation
 
 import invesalius.constants as const
 import invesalius.session as ses
 import invesalius.utils as utils
+from invesalius.data import imagedata_utils
 from invesalius.i18n import tr as _
 from invesalius.pubsub import pub as Publisher
 
@@ -716,16 +719,21 @@ class InnerTaskPanel(wx.Panel):
 
     def _on_coil_pose(self, coord):
         """Store the latest coil pose broadcast by the navigation module."""
-        import numpy as np
-        from scipy.spatial.transform import Rotation
-
-        if not coord or len(coord) < 6:
+        if coord is None or len(coord) < 6:
             return
-        x, y, z, rx, ry, rz = coord
-        R = Rotation.from_euler("xyz", [rx, ry, rz], degrees=True).as_matrix()
+
+        position, _ = imagedata_utils.convert_invesalius_to_world(
+            position=coord[:3],
+            orientation=coord[3:],
+        )
+
+        R = Rotation.from_euler("xyz", coord[3:], degrees=True).as_matrix()
+        R = R @ Rotation.from_euler("z", -90, degrees=True).as_matrix()
+
         mat = np.eye(4)
         mat[:3, :3] = R
-        mat[:3, 3] = [x, y, z]
+        mat[:3, 3] = position
+
         self._matsimnibs = mat.tolist()
 
     def OnLockPose(self, _evt):
