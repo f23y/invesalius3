@@ -42,6 +42,7 @@ _KEY_COIL_FILE = "simnibs_last_coil_file"
 _KEY_T1_FILE = "simnibs_last_t1_file"
 _KEY_T2_FILE = "simnibs_last_t2_file"
 _KEY_EFIELD_FILE = "simnibs_last_efield_file"
+_KEY_POSE_FILE = "simnibs_last_pose_file"
 
 TOPIC_LOAD_SURFACES = "Load SimNIBS surfaces"
 TOPIC_LOAD_RESULT = "Load SimNIBS result"
@@ -265,7 +266,7 @@ class InnerTaskPanel(wx.Panel):
         sz_hm.Add(self.gauge_charm, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
         sz_hm.Add(self.lbl_charm, 0, wx.LEFT | wx.BOTTOM, 2)
 
-        self.btn_load_tissues = wx.Button(self, -1, _("Load tissue surfaces…"))
+        self.btn_load_tissues = wx.Button(self, -1, _("Load tissue surfaces"))
         self.btn_load_tissues.SetToolTip(
             _(
                 "Select a tissue-label NIfTI from the m2m folder,\n"
@@ -319,9 +320,21 @@ class InnerTaskPanel(wx.Panel):
         )
         sz_sim.Add(self.txt_mat, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
 
+        row_pose = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_lock = wx.Button(self, -1, _("Lock current coil pose"), size=wx.Size(160, -1))
         self.btn_lock.Bind(wx.EVT_BUTTON, self.OnLockPose)
-        sz_sim.Add(self.btn_lock, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
+        row_pose.Add(self.btn_lock, 0, wx.RIGHT, 2)
+
+        self.btn_load_pose = wx.Button(self, -1, _("Load coil pose"), size=wx.Size(130, -1))
+        self.btn_load_pose.SetToolTip(
+            _(
+                "Load a 4x4 coil pose (matsimnibs) matrix from a text file,\n"
+                "as an alternative to receiving one from neuronavigation.\n"
+            )
+        )
+        self.btn_load_pose.Bind(wx.EVT_BUTTON, self.OnLoadCoilPose)
+        row_pose.Add(self.btn_load_pose, 0)
+        sz_sim.Add(row_pose, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
 
         row_sim = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_run_sim = wx.Button(self, -1, _("Run simulation"), size=wx.Size(110, -1))
@@ -436,7 +449,8 @@ class InnerTaskPanel(wx.Panel):
         self.session.SetConfig(key, value)
 
     def _browse_file(self, wildcard, session_key, msg=""):
-        last_dir = self.session.GetConfig(session_key, "")
+        last = self.session.GetConfig(session_key, "")
+        last_dir = os.path.dirname(last) if last else ""
         dialog = wx.FileDialog(
             self,
             message=msg or _("Select file"),
@@ -459,7 +473,7 @@ class InnerTaskPanel(wx.Panel):
         dialog.Destroy()
         if path:
             path = utils.decode(path, const.FS_ENCODE)
-            self._save_path(session_key, os.path.dirname(path))
+            self._save_path(session_key, path)
         return path
 
     def _browse_dir(self, session_key, msg=""):
@@ -757,6 +771,40 @@ class InnerTaskPanel(wx.Panel):
             f"[ {m[r, 0]:7.3f}  {m[r, 1]:7.3f}  {m[r, 2]:7.3f}  {m[r, 3]:8.2f} ]" for r in range(4)
         ]
         self.txt_mat.SetValue("\n".join(lines))
+
+    def OnLoadCoilPose(self, _evt):
+        path = self._browse_file(
+            _("Coil pose matrix (*.txt;*.csv;*.mat)|*.txt;*.csv;*.mat|All files (*.*)|*.*"),
+            _KEY_POSE_FILE,
+            _("Select a 4x4 coil pose (matsimnibs) matrix"),
+        )
+        if not path:
+            return
+        try:
+            mat = self._read_matsimnibs(path)
+        except Exception as exc:  # noqa: BLE001 - report to the user
+            wx.MessageBox(
+                _("Could not read a 4x4 coil pose matrix from:\n{}\n\n{}").format(path, exc),
+                _("Invalid coil pose"),
+                wx.ICON_ERROR,
+            )
+            return
+        self._matsimnibs = mat.tolist()
+        self._pose_locked = True
+        self._refresh_mat_display(mat)
+        self.lbl_sim.SetLabel(_("Coil pose loaded from file."))
+
+    @staticmethod
+    def _read_matsimnibs(path: str):
+        """Read a 4x4 matsimnibs matrix from a whitespace- or comma-delimited text file."""
+        try:
+            arr = np.loadtxt(path)
+        except ValueError:
+            arr = np.loadtxt(path, delimiter=",")
+        arr = np.asarray(arr, dtype=float)
+        if arr.size != 16:
+            raise ValueError(_("expected 16 numbers forming a 4x4 matrix, got {}").format(arr.size))
+        return arr.reshape(4, 4)
 
     def OnRunSimulation(self, _evt):
         m2m_path = self.txt_m2m.GetValue().strip()
