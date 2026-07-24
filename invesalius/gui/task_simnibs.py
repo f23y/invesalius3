@@ -85,9 +85,13 @@ def _simnibs_site_packages() -> str | None:
     import glob
 
     simnibs_root = os.path.dirname(os.path.dirname(charm_exe))
-    candidates = glob.glob(
-        os.path.join(simnibs_root, "simnibs_env", "lib", "python*", "site-packages")
-    )
+    if sys.platform == "win32":
+        candidates = glob.glob(os.path.join(simnibs_root, "simnibs_env", "Lib", "site-packages"))
+    else:
+        candidates = glob.glob(
+            os.path.join(simnibs_root, "simnibs_env", "lib", "python*", "site-packages")
+        )
+
     return candidates[0] if candidates else None
 
 
