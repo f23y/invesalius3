@@ -286,16 +286,19 @@ class InnerTaskPanel(wx.Panel):
 
         self.txt_m2m = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
         self.txt_sim_out = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
-        self.txt_coil = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
+        self.cmb_coil = wx.ComboBox(self, -1, "", size=wx.Size(120, -1), style=wx.CB_READONLY)
+        self._coil_paths: dict[str, str] = {}
+        self._populate_coil_models()
         self.txt_didt = wx.TextCtrl(self, -1, "1000000.0")
 
         btn_m2m = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
         btn_sim_out = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
-        btn_coil = wx.Button(self, -1, _("…"), size=wx.Size(28, -1))
+        btn_coil = wx.Button(self, -1, _("Add coil"))
 
         btn_m2m.Bind(wx.EVT_BUTTON, self.OnBrowseM2M)
         btn_sim_out.Bind(wx.EVT_BUTTON, self.OnBrowseSimOutput)
-        btn_coil.Bind(wx.EVT_BUTTON, self.OnBrowseCoil)
+        btn_coil.Bind(wx.EVT_BUTTON, self.OnAddCoil)
+        self.cmb_coil.Bind(wx.EVT_COMBOBOX, self.OnCoilSelected)
 
         g2 = wx.FlexGridSizer(4, 3, 2, 2)
         g2.AddGrowableCol(1)
@@ -305,8 +308,8 @@ class InnerTaskPanel(wx.Panel):
         g2.Add(wx.StaticText(self, -1, _("Output dir:")), 0, wx.ALIGN_CENTER_VERTICAL)
         g2.Add(self.txt_sim_out, 1, wx.EXPAND)
         g2.Add(btn_sim_out, 0)
-        g2.Add(wx.StaticText(self, -1, _("Coil file:")), 0, wx.ALIGN_CENTER_VERTICAL)
-        g2.Add(self.txt_coil, 1, wx.EXPAND)
+        g2.Add(wx.StaticText(self, -1, _("Coil model:")), 0, wx.ALIGN_CENTER_VERTICAL)
+        g2.Add(self.cmb_coil, 1, wx.EXPAND)
         g2.Add(btn_coil, 0)
         g2.Add(wx.StaticText(self, -1, _("dI/dt (A/s):")), 0, wx.ALIGN_CENTER_VERTICAL)
         g2.Add(self.txt_didt, 1, wx.EXPAND)
@@ -443,7 +446,9 @@ class InnerTaskPanel(wx.Panel):
     def _restore_paths(self):
         self.txt_m2m.SetValue(self.session.GetConfig(_KEY_M2M_DIR, ""))
         self.txt_sim_out.SetValue(self.session.GetConfig(_KEY_OUTPUT_DIR, ""))
-        self.txt_coil.SetValue(self.session.GetConfig(_KEY_COIL_FILE, ""))
+        saved_coil = self.session.GetConfig(_KEY_COIL_FILE, "")
+        if saved_coil:
+            self._select_coil_path(saved_coil)
         self.txt_t1.SetValue(self.session.GetConfig(_KEY_T1_FILE, ""))
         self.txt_t2.SetValue(self.session.GetConfig(_KEY_T2_FILE, ""))
         if self.session.GetConfig(_KEY_M2M_DIR, ""):
@@ -543,14 +548,51 @@ class InnerTaskPanel(wx.Panel):
         if path:
             self.txt_sim_out.SetValue(path)
 
-    def OnBrowseCoil(self, _evt):
+    def _populate_coil_models(self):
+        sp = _simnibs_site_packages()
+        if not sp:
+            return
+        root = os.path.join(sp, "simnibs", "resources", "coil_models")
+        if not os.path.isdir(root):
+            return
+        found: dict[str, str] = {}
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if name.lower().endswith((".ccd", ".tcd")):
+                    full = os.path.join(dirpath, name)
+                    found[os.path.relpath(full, root)] = full
+        for display in sorted(found, key=str.lower):
+            self._coil_paths[display] = found[display]
+            self.cmb_coil.Append(display)
+
+    def _select_coil_path(self, path):
+        target = os.path.normcase(os.path.abspath(path))
+        for display, full in self._coil_paths.items():
+            if os.path.normcase(os.path.abspath(full)) == target:
+                self.cmb_coil.SetValue(display)
+                return
+        display = _("(added) {}").format(os.path.basename(path))
+        self._coil_paths[display] = path
+        if self.cmb_coil.FindString(display) == wx.NOT_FOUND:
+            self.cmb_coil.Append(display)
+        self.cmb_coil.SetValue(display)
+
+    def _selected_coil_path(self):
+        return self._coil_paths.get(self.cmb_coil.GetValue(), "")
+
+    def OnCoilSelected(self, _evt):
+        path = self._selected_coil_path()
+        if path:
+            self._save_path(_KEY_COIL_FILE, path)
+
+    def OnAddCoil(self, _evt):
         path = self._browse_file(
             _("SimNIBS coil (*.tcd;*.ccd)|*.tcd;*.ccd|All files (*.*)|*.*"),
             _KEY_COIL_FILE,
-            _("Select SimNIBS coil file"),
+            _("Add a SimNIBS coil file"),
         )
         if path:
-            self.txt_coil.SetValue(path)
+            self._select_coil_path(path)
 
     def OnForceQform(self, _evt):
         if self.chk_force_qform.GetValue():
@@ -813,7 +855,7 @@ class InnerTaskPanel(wx.Panel):
     def OnRunSimulation(self, _evt):
         m2m_path = self.txt_m2m.GetValue().strip()
         out_dir = self.txt_sim_out.GetValue().strip()
-        coil = self.txt_coil.GetValue().strip()
+        coil = self._selected_coil_path().strip()
 
         try:
             didt = float(self.txt_didt.GetValue())
