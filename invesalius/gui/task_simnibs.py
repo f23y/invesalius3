@@ -17,6 +17,7 @@
 #    detalhes.
 # --------------------------------------------------------------------------
 
+import glob
 import logging
 import os
 import shutil
@@ -25,9 +26,9 @@ import tempfile
 
 import numpy as np
 import wx
-from scipy.spatial.transform import Rotation
 
 import invesalius.constants as const
+import invesalius.data.transformations as tr
 import invesalius.session as ses
 import invesalius.utils as utils
 from invesalius.data import imagedata_utils
@@ -44,19 +45,21 @@ _KEY_T2_FILE = "simnibs_last_t2_file"
 _KEY_EFIELD_FILE = "simnibs_last_efield_file"
 _KEY_POSE_FILE = "simnibs_last_pose_file"
 
-TOPIC_LOAD_SURFACES = "Load SimNIBS surfaces"
-TOPIC_LOAD_RESULT = "Load SimNIBS result"
-TOPIC_REMOVE_SURFACES = "Remove SimNIBS surfaces"
-TOPIC_SET_VISIBILITY = "Set SimNIBS surface visibility"
-TOPIC_SET_OPACITY = "Set SimNIBS surface opacity"
-TOPIC_SET_COLORMAP = "Set SimNIBS colormap"
-TOPIC_SET_THRESHOLD = "Set SimNIBS threshold"
-TOPIC_SURFACES_LOADED = "SimNIBS surfaces loaded"
+TOPIC_LOAD_RESULT = "Load SimNIBS efield into viewer"
+TOPIC_REMOVE_EFIELD = "Remove SimNIBS efield from viewer"
+TOPIC_SET_OPACITY = "Set SimNIBS efield opacity"
+TOPIC_SET_COLORMAP = "Set SimNIBS efield colormap"
+TOPIC_SET_THRESHOLD = "Set SimNIBS efield threshold"
+TOPIC_HIGHLIGHT_ABOVE_THRESHOLD = "Show area above threshold"
 TOPIC_EFIELD_LOADED = "SimNIBS efield loaded"
 TOPIC_PROGRESS = "SimNIBS progress"
 TOPIC_ERROR = "SimNIBS error"
 TOPIC_CHARM_DONE = "Charm done"
 TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
+
+_AXES_INV_TO_SIMNIBS = (
+    tr.euler_matrix(0, 0, np.radians(-90))[:3, :3] @ tr.euler_matrix(np.radians(180), 0, 0)[:3, :3]
+)
 
 
 def _find_charm() -> str | None:
@@ -82,7 +85,6 @@ def _simnibs_site_packages() -> str | None:
     charm_exe = _find_charm()
     if not charm_exe:
         return None
-    import glob
 
     simnibs_root = os.path.dirname(os.path.dirname(charm_exe))
     if sys.platform == "win32":
@@ -163,22 +165,15 @@ class InnerTaskPanel(wx.Panel):
 
         self.session = ses.Session()
         self._m2m_path = None
-        self._pose_locked = False
         self._matsimnibs = None
         self._running = None
-        self._surface_names: list[str] = []
         self._mask_index_by_name: dict[str, int] = {}
-
-        from invesalius.data.simnibs_efield import SimnibsEfieldRenderer
-
-        self._efield_renderer = SimnibsEfieldRenderer()
 
         self._subscribe()
         self._build_ui()
         self._restore_paths()
 
     def _subscribe(self):
-        Publisher.subscribe(self._on_surfaces_loaded, TOPIC_SURFACES_LOADED)
         Publisher.subscribe(self._on_efield_loaded, TOPIC_EFIELD_LOADED)
         Publisher.subscribe(self._on_progress, TOPIC_PROGRESS)
         Publisher.subscribe(self._on_error, TOPIC_ERROR)
@@ -370,10 +365,12 @@ class InnerTaskPanel(wx.Panel):
         self.combo_surface = wx.ComboBox(self, -1, style=wx.CB_DROPDOWN | wx.CB_READONLY)
         self.combo_surface.SetToolTip(
             _(
-                "Choose which tissue surface the E-field is overlaid on.\n"
-                "Populated after loading tissue surfaces from the m2m folder."
+                "The surface the E-field is painted on, which also stays\n"
+                "visible while the other tissue surfaces are hidden.\n"
+                "Lists every surface in the project."
             )
         )
+        self.combo_surface.Bind(wx.EVT_COMBOBOX_DROPDOWN, self._refresh_surface_dropdown)
         self.combo_surface.Bind(wx.EVT_COMBOBOX, self.OnSurfaceSelect)
         row_surf.Add(self.combo_surface, 1)
         sz_ef.Add(row_surf, 0, wx.EXPAND | wx.ALL, 2)
@@ -409,11 +406,14 @@ class InnerTaskPanel(wx.Panel):
 
         row_op = wx.BoxSizer(wx.HORIZONTAL)
         row_op.Add(
-            wx.StaticText(self, -1, _("Skin opacity:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+            wx.StaticText(self, -1, _("E-field opacity:")),
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            4,
         )
         self.spin_opacity = wx.SpinCtrlDouble(self, -1, "", size=wx.Size(60, -1), inc=0.05)
         self.spin_opacity.SetRange(0.0, 1.0)
-        self.spin_opacity.SetValue(0.4)
+        self.spin_opacity.SetValue(1.0)
         self.spin_opacity.Bind(wx.EVT_TEXT, self.OnOpacity)
         self.spin_opacity.Bind(wx.EVT_SPINCTRL, self.OnOpacity)
         row_op.Add(self.spin_opacity, 0)
@@ -426,12 +426,22 @@ class InnerTaskPanel(wx.Panel):
         self.spin_threshold = wx.SpinCtrlDouble(self, -1, "", size=wx.Size(60, -1), inc=1.0)
         self.spin_threshold.SetRange(0.0, 100.0)
         self.spin_threshold.SetValue(90.0)
+        self.spin_threshold.SetToolTip(
+            _(
+                "Share of the maximum field value above which the area is\n"
+                "considered stimulated, as a percentage."
+            )
+        )
         self.spin_threshold.Bind(wx.EVT_TEXT, self.OnThreshold)
         self.spin_threshold.Bind(wx.EVT_SPINCTRL, self.OnThreshold)
         row_th.Add(self.spin_threshold, 0)
         sz_ef.Add(row_th, 0, wx.ALL, 2)
 
-        self.btn_remove = wx.Button(self, -1, _("Remove all actors"), size=wx.Size(140, -1))
+        self.chk_highlight = wx.CheckBox(self, -1, _("Highlight area above threshold"))
+        self.chk_highlight.Bind(wx.EVT_CHECKBOX, self.OnHighlightAboveThreshold)
+        sz_ef.Add(self.chk_highlight, 0, wx.ALL, 2)
+
+        self.btn_remove = wx.Button(self, -1, _("Remove E-field"), size=wx.Size(140, -1))
         self.btn_remove.Bind(wx.EVT_BUTTON, self.OnRemove)
         sz_ef.Add(self.btn_remove, 0, wx.ALL, 2)
 
@@ -700,7 +710,6 @@ class InnerTaskPanel(wx.Panel):
 
     def _load_tissue_surfaces(self, labels_nii: str) -> None:
         import nibabel as nib
-        import numpy as np
 
         import invesalius.project as prj
 
@@ -767,13 +776,12 @@ class InnerTaskPanel(wx.Panel):
                     "quality": _("Optimal *"),
                     "fill": False,
                     "fill_border_holes": False,
-                    "keep_largest": True,
+                    "keep_largest": False,
                     "overwrite": False,
                 },
             }
             Publisher.sendMessage("Create surface from index", surface_parameters=surface_params)
 
-        self._surface_names = [name for _, name in created]
         self._mask_index_by_name = {name: mask_idx for mask_idx, name in created}
         self._refresh_surface_dropdown()
 
@@ -782,23 +790,19 @@ class InnerTaskPanel(wx.Panel):
         if coord is None or len(coord) < 6:
             return
 
-        position, _ = imagedata_utils.convert_invesalius_to_world(
+        position, orientation = imagedata_utils.convert_invesalius_to_world(
             position=coord[:3],
             orientation=coord[3:],
         )
+        if position[0] is None:
+            return
 
-        R = Rotation.from_euler("xyz", coord[3:], degrees=True).as_matrix()
-        R = R @ Rotation.from_euler("z", -90, degrees=True).as_matrix()
-
-        mat = np.eye(4)
-        mat[:3, :3] = R
-        mat[:3, 3] = position
+        mat = tr.compose_matrix(angles=np.radians(orientation), translate=position)
+        mat[:3, :3] = mat[:3, :3] @ _AXES_INV_TO_SIMNIBS
 
         self._matsimnibs = mat.tolist()
 
     def OnLockPose(self, _evt):
-        import numpy as np
-
         if self._matsimnibs is None:
             wx.MessageBox(
                 _("No coil pose received yet.\nThe navigation module must send a coil pose first."),
@@ -806,12 +810,9 @@ class InnerTaskPanel(wx.Panel):
                 wx.ICON_WARNING,
             )
             return
-        self._pose_locked = True
         self._refresh_mat_display(np.array(self._matsimnibs))
 
     def _refresh_mat_display(self, mat=None):
-        import numpy as np
-
         m = mat if mat is not None else np.eye(4)
         lines = [
             f"[ {m[r, 0]:7.3f}  {m[r, 1]:7.3f}  {m[r, 2]:7.3f}  {m[r, 3]:8.2f} ]" for r in range(4)
@@ -836,7 +837,6 @@ class InnerTaskPanel(wx.Panel):
             )
             return
         self._matsimnibs = mat.tolist()
-        self._pose_locked = True
         self._refresh_mat_display(mat)
         self.lbl_sim.SetLabel(_("Coil pose loaded from file."))
 
@@ -853,6 +853,8 @@ class InnerTaskPanel(wx.Panel):
         return arr.reshape(4, 4)
 
     def OnRunSimulation(self, _evt):
+        import invesalius.project as prj
+
         m2m_path = self.txt_m2m.GetValue().strip()
         out_dir = self.txt_sim_out.GetValue().strip()
         coil = self._selected_coil_path().strip()
@@ -866,6 +868,15 @@ class InnerTaskPanel(wx.Panel):
         if not m2m_path or not out_dir or not coil:
             wx.MessageBox(
                 _("Please fill in m2m path, output folder, and coil file."),
+                _("Missing input"),
+                wx.ICON_WARNING,
+            )
+            return
+
+        self._refresh_surface_dropdown()
+        if prj.Project().surface_dict and self._selected_surface_index() is None:
+            wx.MessageBox(
+                _("Select the surface to paint the E-field on before running the simulation."),
                 _("Missing input"),
                 wx.ICON_WARNING,
             )
@@ -895,10 +906,6 @@ class InnerTaskPanel(wx.Panel):
         self.btn_cancel_sim.Enable(False)
         self.lbl_sim.SetLabel(_("Cancel requested."))
 
-    def _on_surfaces_loaded(self, surfaces):
-        self.btn_run_sim.Enable(True)
-        self.lbl_sim.SetLabel(_("Head surfaces loaded."))
-
     def _on_efield_loaded(self, result_msh):
         self._running = None
         label = os.path.basename(result_msh) if result_msh else _("Simulation complete.")
@@ -906,6 +913,13 @@ class InnerTaskPanel(wx.Panel):
         self.gauge_sim.SetValue(100)
         self.btn_run_sim.Enable(True)
         self.btn_cancel_sim.Enable(False)
+
+        if result_msh and result_msh.lower().endswith((".vtk", ".vtp")):
+            self._load_efield_result(result_msh)
+        elif result_msh:
+            log.warning(
+                "SimNIBS returned %s, which is not a surface the viewer can read", result_msh
+            )
 
     def _on_progress(self, message, percent):
         if self._running == "charm":
@@ -931,41 +945,64 @@ class InnerTaskPanel(wx.Panel):
         import invesalius.project as prj
 
         selected = self.combo_surface.GetStringSelection()
-        surface_dict = prj.Project().surface_dict
-        index_by_name = {surface.name: index for index, surface in surface_dict.items()}
+        index_by_name = {s.name: index for index, s in prj.Project().surface_dict.items()}
 
-        for name in self._surface_names:
+        for name, mask_index in self._mask_index_by_name.items():
+            visible = name == selected
             index = index_by_name.get(name)
             if index is not None:
-                Publisher.sendMessage("Show surface", index=index, visibility=(name == selected))
-
-        for name in self._surface_names:
-            if name == selected:
-                continue
-            mask_index = self._mask_index_by_name.get(name)
-            if mask_index is not None:
-                Publisher.sendMessage("Show mask", index=mask_index, value=False)
+                Publisher.sendMessage("Show surface", index=index, visibility=visible)
+            Publisher.sendMessage("Show mask", index=mask_index, value=visible)
 
         selected_mask_index = self._mask_index_by_name.get(selected)
         if selected_mask_index is not None:
             Publisher.sendMessage("Change mask selected", index=selected_mask_index)
-            Publisher.sendMessage("Show mask", index=selected_mask_index, value=True)
 
-    def _refresh_surface_dropdown(self) -> None:
+    def _refresh_surface_dropdown(self, _evt=None) -> None:
+        """List every surface in the project, keeping the current selection."""
+        import invesalius.project as prj
+
+        selected = self.combo_surface.GetStringSelection()
+        names = [str(s.name) for s in prj.Project().surface_dict.values()]
+
         self.combo_surface.Clear()
-        for name in self._surface_names:
+        for name in names:
             self.combo_surface.Append(name)
-        if self._surface_names:
+
+        if selected in names:
+            self.combo_surface.SetStringSelection(selected)
+        elif names:
             self.combo_surface.SetSelection(0)
+
+    def _selected_surface_index(self):
+        """Project index of the surface to paint the E-field on, or None."""
+        import invesalius.project as prj
+
+        surface_dict = prj.Project().surface_dict
+        if not surface_dict:
+            return None
+
+        selected = self.combo_surface.GetStringSelection()
+        for index, surface in surface_dict.items():
+            if str(surface.name) == selected:
+                return index
+        return None
 
     def OnColormap(self, _evt):
         Publisher.sendMessage(TOPIC_SET_COLORMAP, colormap=self.combo_cmap.GetValue())
 
     def OnOpacity(self, _evt):
-        Publisher.sendMessage(TOPIC_SET_OPACITY, name="skin", opacity=self.spin_opacity.GetValue())
+        Publisher.sendMessage(TOPIC_SET_OPACITY, opacity=self.spin_opacity.GetValue())
 
     def OnThreshold(self, _evt):
-        Publisher.sendMessage(TOPIC_SET_THRESHOLD, threshold_pct=self.spin_threshold.GetValue())
+        Publisher.sendMessage(TOPIC_SET_THRESHOLD, threshold=self._threshold())
+
+    def OnHighlightAboveThreshold(self, _evt):
+        Publisher.sendMessage(TOPIC_HIGHLIGHT_ABOVE_THRESHOLD, enable=self.chk_highlight.GetValue())
+        Publisher.sendMessage(TOPIC_SET_THRESHOLD, threshold=self._threshold())
+
+    def _threshold(self):
+        return self.spin_threshold.GetValue() / 100.0
 
     def OnLoadEfieldResult(self, _evt):
         path = self._browse_file(
@@ -974,33 +1011,39 @@ class InnerTaskPanel(wx.Panel):
             _("Select E-field surface (.vtk/.vtp)"),
         )
         if path:
-            Publisher.sendMessage(TOPIC_LOAD_RESULT, filepath=path)
+            self._load_efield_result(path)
+
+    def _load_efield_result(self, filepath: str) -> None:
+        import invesalius.project as prj
+
+        self._refresh_surface_dropdown()
+        surface_index = self._selected_surface_index()
+        if surface_index is None and prj.Project().surface_dict:
+            wx.MessageBox(
+                _("Select the surface to paint the E-field on first."),
+                _("SimNIBS"),
+                wx.ICON_WARNING,
+            )
+            return
+
+        try:
+            Publisher.sendMessage(
+                TOPIC_LOAD_RESULT,
+                filepath=filepath,
+                surface_index=surface_index,
+                colormap=self.combo_cmap.GetValue(),
+                threshold=self._threshold(),
+                opacity=self.spin_opacity.GetValue(),
+            )
+        except Exception as exc:  # noqa: BLE001 - report to the user
+            log.exception("SimNIBS E-field surface could not be loaded")
+            wx.MessageBox(
+                _("Could not load the E-field surface:\n{}\n\n{}").format(filepath, exc),
+                _("SimNIBS"),
+                wx.ICON_ERROR,
+            )
+            return
+        self.lbl_sim.SetLabel(_("E-field loaded: {}").format(os.path.basename(filepath)))
 
     def OnRemove(self, _evt):
-        Publisher.sendMessage(TOPIC_REMOVE_SURFACES)
-
-    @staticmethod
-    def _head_msh_from_m2m(m2m_path: str) -> str:
-        """m2m_ernie/ → m2m_ernie/ernie.msh"""
-        folder = os.path.basename(os.path.normpath(m2m_path))
-        subj = folder[4:] if folder.startswith("m2m_") else folder
-        return os.path.join(m2m_path, f"{subj}.msh")
-
-    @staticmethod
-    def _next_session_dir(output_dir: str) -> str:
-        """Return (and create) the next simulations/session_NNN/ folder."""
-        sim_root = os.path.join(output_dir, "simulations")
-        os.makedirs(sim_root, exist_ok=True)
-        n = (
-            len(
-                [
-                    d
-                    for d in os.listdir(sim_root)
-                    if d.startswith("session_") and os.path.isdir(os.path.join(sim_root, d))
-                ]
-            )
-            + 1
-        )
-        path = os.path.join(sim_root, f"session_{n:03d}")
-        os.makedirs(path, exist_ok=True)
-        return path
+        Publisher.sendMessage(TOPIC_REMOVE_EFIELD)

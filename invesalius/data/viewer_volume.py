@@ -367,6 +367,9 @@ class Viewer(wx.Panel):
         self.ClusterEfieldTextActor = None
         self.enableefieldabovethreshold = False
         self.efield_tools = False
+        self.simnibs_efield_actor = None
+        self.efield_colormap = None
+        self.simnibs_borrowed_state = None
         self.save_automatically = False
         self.positions_above_threshold = None
         self.cell_id_indexes_above_threshold = None
@@ -760,6 +763,14 @@ class Viewer(wx.Panel):
         Publisher.subscribe(self.Getdiperdtforreport, "Get diperdt used in efield calculation")
         Publisher.subscribe(self.UpdateTractSeedBasedEfield, "Update tract seed based efield")
         Publisher.subscribe(self.Get_meshes_paths_to_report, "Get path meshes")
+
+        # E-field from a SimNIBS simulation
+        Publisher.subscribe(self.LoadSimnibsEfield, "Load SimNIBS efield into viewer")
+        Publisher.subscribe(self.RemoveSimnibsEfield, "Remove SimNIBS efield from viewer")
+        Publisher.subscribe(self.SetSimnibsEfieldColormap, "Set SimNIBS efield colormap")
+        Publisher.subscribe(self.SetSimnibsEfieldOpacity, "Set SimNIBS efield opacity")
+        Publisher.subscribe(self.SetSimnibsEfieldThreshold, "Set SimNIBS efield threshold")
+        Publisher.subscribe(self.ReleaseSimnibsEfield, "Remove surface actor from viewer")
 
         # SSAO related
         Publisher.subscribe(self._EnableSSAO, "Enable SSAO")
@@ -2203,13 +2214,35 @@ class Viewer(wx.Panel):
         wx.CallAfter(Publisher.sendMessage, "Initialize color array")
         wx.CallAfter(Publisher.sendMessage, "Recolor efield actor")
 
-    def CreateLUTTableForEfield(self, min, max, highlight_threshold=False):
+    def _BuildColormapLUT(self, colormap_name, min, max, number_colors=256):
+        from matplotlib.colors import LinearSegmentedColormap
+
+        definition = const.MEP_COLORMAP_DEFINITIONS.get(colormap_name)
+        if definition is None:
+            return None
+
+        colors = list(definition.values())  # min, low, mid, max
+        positions = [0.0, 0.25, 0.5, 1.0]
+        cmap = LinearSegmentedColormap.from_list(colormap_name, list(zip(positions, colors)))
+
         lut = vtkLookupTable()
         lut.SetTableRange(min, max)
-        colorSeries = vtkColorSeries()
-        seriesEnum = colorSeries.BREWER_SEQUENTIAL_BLUE_PURPLE_9
-        colorSeries.SetColorScheme(seriesEnum)
-        colorSeries.BuildLookupTable(lut, colorSeries.ORDINAL)
+        lut.SetNumberOfTableValues(number_colors)
+        for i in range(number_colors):
+            r, g, b, a = cmap(i / (number_colors - 1))
+            lut.SetTableValue(i, r, g, b, a)
+        lut.Build()
+        return lut
+
+    def CreateLUTTableForEfield(self, min, max, highlight_threshold=False):
+        lut = self._BuildColormapLUT(self.efield_colormap, min, max)
+        if lut is None:
+            lut = vtkLookupTable()
+            lut.SetTableRange(min, max)
+            colorSeries = vtkColorSeries()
+            seriesEnum = colorSeries.BREWER_SEQUENTIAL_BLUE_PURPLE_9
+            colorSeries.SetColorScheme(seriesEnum)
+            colorSeries.BuildLookupTable(lut, colorSeries.ORDINAL)
         n = lut.GetNumberOfTableValues()
         threshold = self.efield_threshold
         if highlight_threshold:
@@ -2587,6 +2620,147 @@ class Viewer(wx.Panel):
 
         if self.edge_actor is not None:
             self.ren.RemoveActor(self.edge_actor)
+
+    def LoadSimnibsEfield(
+        self, filepath, surface_index=None, colormap=None, threshold=None, opacity=None
+    ):
+        import invesalius.data.brainmesh_handler as brain
+        import invesalius.data.simnibs_efield as simnibs_efield
+
+        polydata, norms, vectors = simnibs_efield.ReadEfieldSurface(filepath)
+
+        if colormap is not None:
+            self.efield_colormap = colormap
+
+        self.RemoveSimnibsEfield()
+
+        self.simnibs_efield_actor = self._BorrowSurfaceActor(surface_index)
+        self.efield_actor = self.simnibs_efield_actor
+
+        self.InitEfield(brain.E_field_brain(polydata))
+
+        if opacity is not None:
+            self.simnibs_efield_actor.GetProperty().SetOpacity(float(opacity))
+        if threshold is not None:
+            self.UpdateEfieldThreshold(threshold)
+
+        number_of_points = polydata.GetNumberOfPoints()
+        self.Id_list = list(range(number_of_points))
+
+        self.radius_list.Reset()
+        for point_id in self.Id_list:
+            self.radius_list.InsertNextId(point_id)
+
+        self.colors_init = vtkUnsignedCharArray()
+        self.colors_init.SetNumberOfComponents(3)
+        self.colors_init.SetName("Colors")
+        self.colors_init.SetNumberOfTuples(number_of_points)
+        for point_id in self.Id_list:
+            self.colors_init.InsertTuple(point_id, const.CORTEX_COLOR)
+
+        self.e_field_norms_to_save = norms
+        max_index = int(np.argmax(norms))
+        self.Idmax = self.Id_list[max_index]
+        if vectors is not None:
+            self.e_field_col1 = vectors[:, 0]
+            self.e_field_col2 = vectors[:, 1]
+            self.e_field_col3 = vectors[:, 2]
+            self.max_efield_array = list(vectors[max_index])
+        else:
+            self.e_field_col1 = []
+            self.e_field_col2 = []
+            self.e_field_col3 = []
+            self.max_efield_array = None
+
+        self.GetEfieldMaxMin(norms)
+        self._RenderAfterEfieldUpdate()
+
+    def _BorrowSurfaceActor(self, surface_index):
+        if surface_index is not None:
+            self.efield_actor = None
+            try:
+                Publisher.sendMessage("Get Actor", surface_index=surface_index)
+            except KeyError:
+                pass
+            actor = self.efield_actor
+            if actor is not None:
+                self.simnibs_borrowed_state = {
+                    "mapper": actor.GetMapper(),
+                    "opacity": actor.GetProperty().GetOpacity(),
+                    "backface_culling": actor.GetProperty().GetBackfaceCulling(),
+                }
+                return actor
+
+        self.simnibs_borrowed_state = None
+        actor = vtkActor()
+        self.ren.AddActor(actor)
+        return actor
+
+    def _ReturnBorrowedSurfaceActor(self):
+        state = self.simnibs_borrowed_state
+        self.simnibs_borrowed_state = None
+        if state is None:
+            self.ren.RemoveActor(self.simnibs_efield_actor)
+            return
+        actor = self.simnibs_efield_actor
+        actor.SetMapper(state["mapper"])
+        actor.GetProperty().SetOpacity(state["opacity"])
+        actor.GetProperty().SetBackfaceCulling(state["backface_culling"])
+
+    def _RenderAfterEfieldUpdate(self):
+        wx.CallAfter(wx.CallAfter, self.UpdateRender)
+
+    def RemoveSimnibsEfield(self):
+        if self.simnibs_efield_actor is None:
+            return
+
+        self.RemoveEfieldTargetingActors()
+        self.RemoveEfieldVectorActor()
+        self.RemoveEfieldEdges()
+        if self.efield_scalar_bar is not None:
+            self.ren.RemoveActor(self.efield_scalar_bar)
+            self.efield_scalar_bar = None
+
+        self._ReturnBorrowedSurfaceActor()
+        if getattr(self, "efield_actor", None) is self.simnibs_efield_actor:
+            self.efield_actor = None
+        self.simnibs_efield_actor = None
+
+        self.efield_mesh = None
+        self.e_field_norms = None
+        self.radius_list.Reset()
+        self.efield_colormap = None
+        self.UpdateRender()
+
+    def ReleaseSimnibsEfield(self, actor):
+        if self.simnibs_efield_actor is None or actor is not self.simnibs_efield_actor:
+            return
+        self.RemoveSimnibsEfield()
+
+    def SetSimnibsEfieldColormap(self, colormap):
+        if self.simnibs_efield_actor is None:
+            return
+        self.efield_colormap = colormap
+        self._RefreshSimnibsEfield()
+
+    def SetSimnibsEfieldThreshold(self, threshold):
+        """Set the threshold, as a fraction of the maximum field value."""
+        if self.simnibs_efield_actor is None:
+            return
+        self.UpdateEfieldThreshold(threshold)
+        self._RefreshSimnibsEfield()
+
+    def SetSimnibsEfieldOpacity(self, opacity):
+        if self.simnibs_efield_actor is None:
+            return
+        self.simnibs_efield_actor.GetProperty().SetOpacity(float(opacity))
+        self.UpdateRender()
+
+    def _RefreshSimnibsEfield(self):
+        if self.efield_mesh is None:
+            return
+        self.OnUpdateEfieldvis()
+        wx.CallAfter(self.UpdateRender)
 
     def GetNeuronavigationApi(self, neuronavigation_api):
         self.neuronavigation_api = neuronavigation_api
