@@ -168,6 +168,8 @@ class InnerTaskPanel(wx.Panel):
         self._matsimnibs = None
         self._running = None
         self._mask_index_by_name: dict[str, int] = {}
+        self._pulse_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._OnPulse, self._pulse_timer)
 
         self._subscribe()
         self._build_ui()
@@ -384,6 +386,11 @@ class InnerTaskPanel(wx.Panel):
         )
         self.btn_load_efield.Bind(wx.EVT_BUTTON, self.OnLoadEfieldResult)
         sz_ef.Add(self.btn_load_efield, 0, wx.ALL, 2)
+
+        self.gauge_efield = wx.Gauge(self, -1, 100)
+        self.lbl_efield = wx.StaticText(self, -1, _("No E-field loaded."))
+        sz_ef.Add(self.gauge_efield, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
+        sz_ef.Add(self.lbl_efield, 0, wx.LEFT | wx.BOTTOM, 2)
 
         row_cmap = wx.BoxSizer(wx.HORIZONTAL)
         row_cmap.Add(
@@ -907,34 +914,58 @@ class InnerTaskPanel(wx.Panel):
         self.lbl_sim.SetLabel(_("Cancel requested."))
 
     def _on_efield_loaded(self, result_msh):
+        converting = self._running == "convert"
         self._running = None
-        label = os.path.basename(result_msh) if result_msh else _("Simulation complete.")
-        self.lbl_sim.SetLabel(label)
-        self.gauge_sim.SetValue(100)
+        self._StopPulse()
+        if not converting:
+            label = os.path.basename(result_msh) if result_msh else _("Simulation complete.")
+            self.lbl_sim.SetLabel(label)
+            self.gauge_sim.SetValue(100)
         self.btn_run_sim.Enable(True)
         self.btn_cancel_sim.Enable(False)
 
         if result_msh and result_msh.lower().endswith((".vtk", ".vtp")):
+            self.gauge_efield.SetValue(100)
             self._load_efield_result(result_msh)
         elif result_msh:
             log.warning(
                 "SimNIBS returned %s, which is not a surface the viewer can read", result_msh
             )
 
+    def _OnPulse(self, _evt):
+        self.gauge_efield.Pulse()
+
+    def _StartPulse(self):
+        self._pulse_timer.Start(120)
+
+    def _StopPulse(self):
+        if self._pulse_timer.IsRunning():
+            self._pulse_timer.Stop()
+
     def _on_progress(self, message, percent):
         if self._running == "charm":
             self.gauge_charm.SetValue(int(percent or 0))
             self.lbl_charm.SetLabel(message)
+        elif self._running == "convert":
+            if not self._pulse_timer.IsRunning():
+                self.gauge_efield.SetValue(int(percent or 0))
+            self.lbl_efield.SetLabel(message)
         else:
             self.gauge_sim.SetValue(int(percent or 0))
             self.lbl_sim.SetLabel(message)
 
     def _on_error(self, message):
+        converting = self._running == "convert"
         self._running = None
-        self.gauge_charm.SetValue(0)
-        self.gauge_sim.SetValue(0)
-        self.lbl_charm.SetLabel(_("Error."))
-        self.lbl_sim.SetLabel(f"Error: {message}")
+        self._StopPulse()
+        if converting:
+            self.gauge_efield.SetValue(0)
+            self.lbl_efield.SetLabel(_("Conversion failed."))
+        else:
+            self.gauge_charm.SetValue(0)
+            self.gauge_sim.SetValue(0)
+            self.lbl_charm.SetLabel(_("Error."))
+            self.lbl_sim.SetLabel(f"Error: {message}")
         self.btn_run_charm.Enable(True)
         self.btn_cancel_charm.Enable(False)
         self.btn_run_sim.Enable(True)
@@ -1006,12 +1037,39 @@ class InnerTaskPanel(wx.Panel):
 
     def OnLoadEfieldResult(self, _evt):
         path = self._browse_file(
-            _("E-field surface (*.vtk;*.vtp)|*.vtk;*.vtp|All files (*.*)|*.*"),
+            _("E-field result (*.vtk;*.vtp;*.msh)|*.vtk;*.vtp;*.msh|All files (*.*)|*.*"),
             _KEY_EFIELD_FILE,
-            _("Select E-field surface (.vtk/.vtp)"),
+            _("Select an E-field result (.vtk/.vtp or SimNIBS .msh)"),
         )
-        if path:
+        if not path:
+            return
+
+        if path.lower().endswith(".msh"):
+            self._convert_efield_result(path)
+        else:
             self._load_efield_result(path)
+
+    def _convert_efield_result(self, filepath: str) -> None:
+        if Publisher.sendMessage_hook is None:
+            wx.MessageBox(
+                _(
+                    "A .msh has to be converted by the SimNIBS server, but InVesalius "
+                    "is not connected to one.\n\n"
+                    "Start it with --remote-host, or select a .vtk/.vtp surface that "
+                    "has already been converted."
+                ),
+                _("SimNIBS"),
+                wx.ICON_WARNING,
+            )
+            return
+
+        self._running = "convert"
+        Publisher.sendMessage("SimNIBS: Convert msh", result_msh=filepath)
+        self._StartPulse()
+        self.gauge_efield.SetValue(0)
+        self.lbl_efield.SetLabel(
+            _("Converting {} on the SimNIBS server…").format(os.path.basename(filepath))
+        )
 
     def _load_efield_result(self, filepath: str) -> None:
         import invesalius.project as prj
@@ -1043,7 +1101,7 @@ class InnerTaskPanel(wx.Panel):
                 wx.ICON_ERROR,
             )
             return
-        self.lbl_sim.SetLabel(_("E-field loaded: {}").format(os.path.basename(filepath)))
+        self.lbl_efield.SetLabel(_("E-field loaded: {}").format(os.path.basename(filepath)))
 
     def OnRemove(self, _evt):
         Publisher.sendMessage(TOPIC_REMOVE_EFIELD)
