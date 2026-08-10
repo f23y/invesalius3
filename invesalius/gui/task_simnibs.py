@@ -20,6 +20,7 @@
 import glob
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -37,13 +38,14 @@ from invesalius.pubsub import pub as Publisher
 
 log = logging.getLogger(__name__)
 
-_KEY_M2M_DIR = "simnibs_last_m2m_dir"
-_KEY_OUTPUT_DIR = "simnibs_last_output_dir"
-_KEY_COIL_FILE = "simnibs_last_coil_file"
-_KEY_T1_FILE = "simnibs_last_t1_file"
-_KEY_T2_FILE = "simnibs_last_t2_file"
-_KEY_EFIELD_FILE = "simnibs_last_efield_file"
-_KEY_POSE_FILE = "simnibs_last_pose_file"
+_KEY_M2M_DIR = "simnibs_m2m_dir"
+_KEY_SUBJECTS_DIR = "simnibs_subjects_dir"
+_KEY_OUTPUT_DIR = "simnibs_output_dir"
+_KEY_COIL_FILE = "simnibs_coil_file"
+_KEY_T1_FILE = "simnibs_t1_file"
+_KEY_T2_FILE = "simnibs_t2_file"
+_KEY_EFIELD_FILE = "simnibs_efield_file"
+_KEY_POSE_FILE = "simnibs_pose_file"
 
 TOPIC_LOAD_RESULT = "Load SimNIBS efield into viewer"
 TOPIC_REMOVE_EFIELD = "Remove SimNIBS efield from viewer"
@@ -56,6 +58,8 @@ TOPIC_PROGRESS = "SimNIBS progress"
 TOPIC_ERROR = "SimNIBS error"
 TOPIC_CHARM_DONE = "Charm done"
 TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
+TOPIC_SET_TARGET = "Set target"
+TOPIC_UNSET_TARGET = "Unset target"
 
 _AXES_INV_TO_SIMNIBS = (
     tr.euler_matrix(0, 0, np.radians(-90))[:3, :3] @ tr.euler_matrix(np.radians(180), 0, 0)[:3, :3]
@@ -140,6 +144,79 @@ def _label_info(present_labels: list) -> dict:
     return result
 
 
+_SIM_OUT_PREFIX = "simnibs_simulation"
+_MAX_TARGET_NAME = 40
+# Files that only SimNIBS writes into an output folder.
+_SIM_ARTIFACT_PATTERNS = (
+    "simnibs_simulation*.mat",
+    "simnibs_simulation*.log",
+    "*_TMS_*.msh",
+)
+
+
+def _subject_id_from_m2m(m2m_path: str) -> str:
+    """Return <subjectID> from a .../m2m_<subjectID> folder, or "" if not an m2m folder."""
+    name = os.path.basename(os.path.normpath(m2m_path))
+    return name[4:] if name.lower().startswith("m2m_") else ""
+
+
+def _sanitize_for_folder(name: str, limit: int = _MAX_TARGET_NAME) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("._-")
+    return cleaned[:limit].rstrip("._-")
+
+
+def _derive_sim_output_dir(m2m_path: str, target_name: str = "") -> str:
+    """Default output folder for a given m2m folder and coil target."""
+    if not m2m_path:
+        return ""
+    parent = os.path.dirname(os.path.normpath(m2m_path))
+    parts = [_SIM_OUT_PREFIX]
+    subject = _subject_id_from_m2m(m2m_path)
+    if subject:
+        parts.append(subject)
+    target = _sanitize_for_folder(target_name)
+    if target:
+        parts.append(target)
+    return os.path.join(parent, "_".join(parts))
+
+
+def _has_simulation_results(path: str) -> bool:
+    """True if SimNIBS would refuse to run in `path` because it already holds results."""
+    return bool(glob.glob(os.path.join(path, "simnibs_simulation*.mat")))
+
+
+def _is_simnibs_output_dir(path: str) -> bool:
+    """True if `path` holds files SimNIBS wrote, and is therefore safe to empty."""
+    return any(glob.glob(os.path.join(path, pattern)) for pattern in _SIM_ARTIFACT_PATTERNS)
+
+
+def _clear_output_dir(path: str) -> int:
+    """Delete everything inside `path`, keeping the folder itself. Returns entries removed."""
+    if not _is_simnibs_output_dir(path):
+        raise ValueError(f"{path} does not look like a SimNIBS output folder")
+    removed = 0
+    for name in os.listdir(path):
+        entry = os.path.join(path, name)
+        if os.path.isdir(entry) and not os.path.islink(entry):
+            shutil.rmtree(entry)
+        else:
+            os.unlink(entry)
+        removed += 1
+    return removed
+
+
+def _next_free_output_dir(path: str, limit: int = 100) -> str:
+    """Re-running needs a fresh folder."""
+    if not path or not _has_simulation_results(path):
+        return path
+    for n in range(2, limit + 1):
+        candidate = f"{path}_{n:03d}"
+        if not _has_simulation_results(candidate):
+            return candidate
+    return path
+
+
 class TaskPanel(wx.ScrolledWindow):
     def __init__(self, parent):
         wx.ScrolledWindow.__init__(self, parent, style=wx.TAB_TRAVERSAL)
@@ -167,6 +244,10 @@ class InnerTaskPanel(wx.Panel):
         self._m2m_path = None
         self._matsimnibs = None
         self._running = None
+        # False once the user picks a simulation output folder by hand.
+        self._sim_output_is_auto = True
+        # Name of the active coil target, used to name the simulation folder.
+        self._target_name = ""
         self._mask_index_by_name: dict[str, int] = {}
         self._pulse_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._OnPulse, self._pulse_timer)
@@ -181,6 +262,8 @@ class InnerTaskPanel(wx.Panel):
         Publisher.subscribe(self._on_error, TOPIC_ERROR)
         Publisher.subscribe(self._on_charm_done, TOPIC_CHARM_DONE)
         Publisher.subscribe(self._on_coil_pose, TOPIC_COIL_POSE)
+        Publisher.subscribe(self._on_set_target, TOPIC_SET_TARGET)
+        Publisher.subscribe(self._on_unset_target, TOPIC_UNSET_TARGET)
 
     def _build_ui(self):
         # HEAD MODEL
@@ -283,6 +366,16 @@ class InnerTaskPanel(wx.Panel):
 
         self.txt_m2m = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
         self.txt_sim_out = wx.TextCtrl(self, -1, "", style=wx.TE_READONLY)
+        self.txt_sim_out.SetToolTip(
+            _(
+                "Filled in automatically next to the m2m folder, as\n"
+                "simnibs_simulation_<subjectID>_<coil target>.\n"
+                "The target name comes from the navigation target marker, or\n"
+                "from the loaded coil pose file when not navigating.\n"
+                "Browse to choose a different folder; a folder chosen by hand\n"
+                "is kept as is. Created by SimNIBS when the simulation runs."
+            )
+        )
         self.cmb_coil = wx.ComboBox(self, -1, "", size=wx.Size(120, -1), style=wx.CB_READONLY)
         self._coil_paths: dict[str, str] = {}
         self._populate_coil_models()
@@ -312,6 +405,19 @@ class InnerTaskPanel(wx.Panel):
         g2.Add(self.txt_didt, 1, wx.EXPAND)
         g2.AddSpacer(0)
         sz_sim.Add(g2, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.chk_overwrite = wx.CheckBox(self, -1, _("Overwrite previous results"))
+        self.chk_overwrite.SetToolTip(
+            _(
+                "Off: a re-run goes to a new numbered folder (…_002, …_003),\n"
+                "keeping earlier results. On: the output folder is emptied first,\n"
+                "so each target keeps a single folder with its latest result.\n"
+                "SimNIBS refuses to run twice in the same folder, so one or the\n"
+                "other has to happen. You are asked to confirm before anything\n"
+                "is deleted."
+            )
+        )
+        sz_sim.Add(self.chk_overwrite, 0, wx.ALL, 2)
 
         # matsimnibs display
         sz_sim.Add(wx.StaticText(self, -1, _("Coil pose (matsimnibs):")), 0, wx.LEFT | wx.TOP, 2)
@@ -461,8 +567,14 @@ class InnerTaskPanel(wx.Panel):
         self.Layout()
 
     def _restore_paths(self):
-        self.txt_m2m.SetValue(self.session.GetConfig(_KEY_M2M_DIR, ""))
-        self.txt_sim_out.SetValue(self.session.GetConfig(_KEY_OUTPUT_DIR, ""))
+        m2m = self.session.GetConfig(_KEY_M2M_DIR, "")
+        self.txt_m2m.SetValue(m2m)
+        self.txt_hm_out.SetValue(self.session.GetConfig(_KEY_SUBJECTS_DIR, ""))
+        saved_output = self.session.GetConfig(_KEY_OUTPUT_DIR, "")
+        if saved_output:
+            self._set_sim_output_dir(saved_output, auto=False)
+        else:
+            self._autofill_sim_output_dir(m2m)
         saved_coil = self.session.GetConfig(_KEY_COIL_FILE, "")
         if saved_coil:
             self._select_coil_path(saved_coil)
@@ -473,6 +585,39 @@ class InnerTaskPanel(wx.Panel):
 
     def _save_path(self, key, value):
         self.session.SetConfig(key, value)
+
+    def _set_sim_output_dir(self, path: str, auto: bool) -> None:
+        """Show `path` as the simulation output folder."""
+        self.txt_sim_out.SetValue(path)
+        self._sim_output_is_auto = auto
+        if path and not auto:
+            self._save_path(_KEY_OUTPUT_DIR, path)
+
+    def _autofill_sim_output_dir(self, m2m_path: str | None = None) -> None:
+        """Derive the simulation output folder automatically from the m2m path and the coil target."""
+        if not self._sim_output_is_auto:
+            return
+        m2m_path = m2m_path or self.txt_m2m.GetValue().strip()
+        if not m2m_path:
+            return
+        derived = _derive_sim_output_dir(m2m_path, self._target_name)
+        if derived:
+            self._set_sim_output_dir(derived, auto=True)
+
+    def _set_target_name(self, name: str) -> None:
+        """Name the simulation folder after the coil target `name`."""
+        name = _sanitize_for_folder(name or "")
+        if name == self._target_name:
+            return
+        self._target_name = name
+        self._autofill_sim_output_dir()
+
+    def _on_set_target(self, marker):
+        """A navigation target became active."""
+        self._set_target_name(getattr(marker, "label", ""))
+
+    def _on_unset_target(self, marker):
+        self._set_target_name("")
 
     def _browse_file(self, wildcard, session_key, msg=""):
         last = self.session.GetConfig(session_key, "")
@@ -548,7 +693,7 @@ class InnerTaskPanel(wx.Panel):
             self.txt_t2.SetValue(path)
 
     def OnBrowseHMOutput(self, _evt):
-        path = self._browse_dir(_KEY_OUTPUT_DIR, _("Choose subjects root folder"))
+        path = self._browse_dir(_KEY_SUBJECTS_DIR, _("Choose subjects root folder"))
         if path:
             self.txt_hm_out.SetValue(path)
 
@@ -558,12 +703,13 @@ class InnerTaskPanel(wx.Panel):
             self.txt_m2m.SetValue(path)
             self._m2m_path = path
             self._save_path(_KEY_M2M_DIR, path)
+            self._autofill_sim_output_dir(path)
             self.btn_run_sim.Enable(True)
 
     def OnBrowseSimOutput(self, _evt):
         path = self._browse_dir(_KEY_OUTPUT_DIR, _("Choose simulation output folder"))
         if path:
-            self.txt_sim_out.SetValue(path)
+            self._set_sim_output_dir(path, auto=False)
 
     def _populate_coil_models(self):
         sp = _simnibs_site_packages()
@@ -695,6 +841,7 @@ class InnerTaskPanel(wx.Panel):
             self._m2m_path = m2m_dir
             self.txt_m2m.SetValue(m2m_dir)
             self._save_path(_KEY_M2M_DIR, m2m_dir)
+            self._autofill_sim_output_dir(m2m_dir)
             self.btn_run_sim.Enable(True)
 
     def OnLoadTissueSurfaces(self, _evt):
@@ -845,6 +992,8 @@ class InnerTaskPanel(wx.Panel):
             return
         self._matsimnibs = mat.tolist()
         self._refresh_mat_display(mat)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        self._set_target_name(re.sub(r"^(coil_)?pose_", "", stem, flags=re.IGNORECASE))
         self.lbl_sim.SetLabel(_("Coil pose loaded from file."))
 
     @staticmethod
@@ -865,6 +1014,13 @@ class InnerTaskPanel(wx.Panel):
         m2m_path = self.txt_m2m.GetValue().strip()
         out_dir = self.txt_sim_out.GetValue().strip()
         coil = self._selected_coil_path().strip()
+
+        if self.chk_overwrite.GetValue():
+            if not self._clear_previous_results(out_dir):
+                return
+        elif self._sim_output_is_auto:
+            out_dir = _next_free_output_dir(out_dir)
+            self._set_sim_output_dir(out_dir, auto=True)
 
         try:
             didt = float(self.txt_didt.GetValue())
@@ -894,6 +1050,7 @@ class InnerTaskPanel(wx.Panel):
             "output_dir": out_dir,
             "coil": coil,
             "didt": didt,
+            "overwrite": self.chk_overwrite.GetValue(),
         }
         if self._matsimnibs is not None:
             payload["matsimnibs"] = self._matsimnibs
@@ -905,6 +1062,36 @@ class InnerTaskPanel(wx.Panel):
         self.btn_cancel_sim.Enable(True)
         self.gauge_sim.SetValue(0)
         self.lbl_sim.SetLabel(_("Sent to SimNIBS server…"))
+
+    def _clear_previous_results(self, out_dir: str) -> bool:
+        """Empty `out_dir` after confirmation."""
+        if not out_dir or not _is_simnibs_output_dir(out_dir):
+            return True
+
+        count = len(os.listdir(out_dir))
+        msg = _(
+            "Delete the {} file(s) already in the simulation output folder?\n\n"
+            "  {}\n\n"
+            "The results of the previous run are lost. Uncheck "
+            '"Overwrite previous results" to keep them and write this run to a '
+            "new numbered folder instead."
+        ).format(count, out_dir)
+        if (
+            wx.MessageBox(msg, _("Overwrite previous results"), wx.YES_NO | wx.ICON_WARNING)
+            != wx.YES
+        ):
+            return False
+
+        try:
+            _clear_output_dir(out_dir)
+        except Exception as exc:  # noqa: BLE001 - report to the user
+            wx.MessageBox(
+                _("Could not empty the output folder:\n{}\n\n{}").format(out_dir, exc),
+                _("Overwrite failed"),
+                wx.ICON_ERROR,
+            )
+            return False
+        return True
 
     def OnCancelSimulation(self, _evt):
         Publisher.sendMessage("SimNIBS: Cancel simulation")
