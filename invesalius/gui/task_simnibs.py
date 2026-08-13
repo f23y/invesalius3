@@ -32,7 +32,7 @@ import invesalius.constants as const
 import invesalius.data.transformations as tr
 import invesalius.session as ses
 import invesalius.utils as utils
-from invesalius.data import imagedata_utils
+from invesalius.data import imagedata_utils, simnibs_efield
 from invesalius.i18n import tr as _
 from invesalius.pubsub import pub as Publisher
 
@@ -48,6 +48,10 @@ _KEY_EFIELD_FILE = "simnibs_efield_file"
 _KEY_POSE_FILE = "simnibs_pose_file"
 
 TOPIC_LOAD_RESULT = "Load SimNIBS efield into viewer"
+TOPIC_SET_SURFACES = "Set SimNIBS efield surfaces"
+TOPIC_EFIELD_PAINTED = "SimNIBS efield painted"
+TOPIC_SURFACE_ADDED = "Update surface info in GUI"
+TOPIC_SHOW_SURFACES = "Show multiple surfaces"
 TOPIC_REMOVE_EFIELD = "Remove SimNIBS efield from viewer"
 TOPIC_SET_OPACITY = "Set SimNIBS efield opacity"
 TOPIC_SET_COLORMAP = "Set SimNIBS efield colormap"
@@ -142,6 +146,90 @@ def _label_info(present_labels: list) -> dict:
         else:
             result[label] = (f"tissue_{label}", (200, 200, 200))
     return result
+
+
+class _SurfaceListPopup(wx.ComboPopup):
+    """The ticked list of surfaces shown when the dropdown opens."""
+
+    def __init__(self, on_check, on_popup):
+        wx.ComboPopup.__init__(self)
+        self._on_check = on_check
+        self._on_popup = on_popup
+        self.listbox = None
+
+    def Create(self, parent):
+        self.listbox = wx.CheckListBox(parent, choices=[])
+        self.listbox.Bind(wx.EVT_CHECKLISTBOX, self._OnCheck)
+        return True
+
+    def GetControl(self):
+        return self.listbox
+
+    def OnPopup(self):
+        self._on_popup()
+
+    def GetStringValue(self):
+        return ", ".join(self.GetCheckedStrings())
+
+    def GetAdjustedSize(self, min_width, pref_height, max_height):
+        rows = max(self.listbox.GetCount() if self.listbox else 0, 1)
+        return wx.Size(min_width, min(max_height, 8 + rows * 22))
+
+    def _OnCheck(self, evt):
+        evt.Skip()
+        self._on_check()
+
+    def SetItems(self, names):
+        if self.listbox is not None:
+            self.listbox.Set(list(names))
+
+    def GetItems(self):
+        return list(self.listbox.GetStrings()) if self.listbox else []
+
+    def GetCheckedStrings(self):
+        return list(self.listbox.GetCheckedStrings()) if self.listbox else []
+
+    def SetCheckedStrings(self, names):
+        if self.listbox is None:
+            return
+        known = set(self.listbox.GetStrings())
+        self.listbox.SetCheckedStrings([name for name in names if name in known])
+
+
+class SurfaceCheckCombo(wx.ComboCtrl):
+    """A surface dropdown where more than one surface can be ticked."""
+
+    def __init__(self, parent, on_change, on_popup):
+        wx.ComboCtrl.__init__(self, parent, style=wx.CB_READONLY)
+        self._on_change = on_change
+        self._popup = _SurfaceListPopup(self._OnCheck, on_popup)
+        self.SetPopupControl(self._popup)
+        self._ShowChecked()
+
+    def _OnCheck(self):
+        self._ShowChecked()
+        self._on_change()
+
+    def _ShowChecked(self):
+        checked = self.GetChecked()
+        self.SetValue(", ".join(checked) if checked else _("(none — E-field mesh)"))
+
+    def SetSurfaces(self, names):
+        """List `names`, keeping whichever of them were already ticked."""
+        checked = [name for name in self.GetChecked() if name in names]
+        self._popup.SetItems(names)
+        self._popup.SetCheckedStrings(checked)
+        self._ShowChecked()
+
+    def GetSurfaces(self):
+        return self._popup.GetItems()
+
+    def GetChecked(self):
+        return self._popup.GetCheckedStrings()
+
+    def SetChecked(self, names):
+        self._popup.SetCheckedStrings(names)
+        self._ShowChecked()
 
 
 _SIM_OUT_PREFIX = "simnibs_simulation"
@@ -249,6 +337,12 @@ class InnerTaskPanel(wx.Panel):
         # Name of the active coil target, used to name the simulation folder.
         self._target_name = ""
         self._mask_index_by_name: dict[str, int] = {}
+        self._efield_loaded = False
+        # Names of the surfaces the E-field is painted on right now.
+        self._efield_targets: list[str] = []
+        # Set while waiting for surfaces to finish generating, to paint on one of them.
+        self._retarget_on_new_surface = False
+        self._painted_distance = simnibs_efield.EFIELD_SAMPLING_MAX_DISTANCE
         self._pulse_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._OnPulse, self._pulse_timer)
 
@@ -264,6 +358,8 @@ class InnerTaskPanel(wx.Panel):
         Publisher.subscribe(self._on_coil_pose, TOPIC_COIL_POSE)
         Publisher.subscribe(self._on_set_target, TOPIC_SET_TARGET)
         Publisher.subscribe(self._on_unset_target, TOPIC_UNSET_TARGET)
+        Publisher.subscribe(self._on_efield_painted, TOPIC_EFIELD_PAINTED)
+        Publisher.subscribe(self._on_surface_added, TOPIC_SURFACE_ADDED)
 
     def _build_ui(self):
         # HEAD MODEL
@@ -470,18 +566,44 @@ class InnerTaskPanel(wx.Panel):
         row_surf.Add(
             wx.StaticText(self, -1, _("Surface:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
         )
-        self.combo_surface = wx.ComboBox(self, -1, style=wx.CB_DROPDOWN | wx.CB_READONLY)
+        self.combo_surface = SurfaceCheckCombo(
+            self, on_change=self.OnSurfaceSelect, on_popup=self._refresh_surface_dropdown
+        )
         self.combo_surface.SetToolTip(
             _(
-                "The surface the E-field is painted on, which also stays\n"
-                "visible while the other tissue surfaces are hidden.\n"
-                "Lists every surface in the project."
+                "The surfaces the E-field is painted on, in the volume viewer and\n"
+                "as a cross section in the axial, coronal and sagittal views.\n"
+                "Tick as many as you like; those are the surfaces kept visible.\n"
+                "Clearing every tick puts the E-field on a surface of its own.\n"
+                "Loading a result with none ticked picks the best surface for you."
             )
         )
-        self.combo_surface.Bind(wx.EVT_COMBOBOX_DROPDOWN, self._refresh_surface_dropdown)
-        self.combo_surface.Bind(wx.EVT_COMBOBOX, self.OnSurfaceSelect)
         row_surf.Add(self.combo_surface, 1)
         sz_ef.Add(row_surf, 0, wx.EXPAND | wx.ALL, 2)
+
+        row_dist = wx.BoxSizer(wx.HORIZONTAL)
+        row_dist.Add(
+            wx.StaticText(self, -1, _("Max distance (mm):")),
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            4,
+        )
+        self.spin_distance = wx.SpinCtrlDouble(self, -1, "", size=wx.Size(70, -1), inc=1.0)
+        self.spin_distance.SetRange(0.1, 100.0)
+        self.spin_distance.SetValue(simnibs_efield.EFIELD_SAMPLING_MAX_DISTANCE)
+        self.spin_distance.SetToolTip(
+            _(
+                "How far a surface point may be from the E-field mesh and still take\n"
+                "its value. The result is a grey-matter sheet, so a surface further\n"
+                "out shows the field of the tissue underneath it, not its own —\n"
+                "raise this only if that is what you want to see.\n"
+                "Points beyond the distance are left in their plain colour."
+            )
+        )
+        self.spin_distance.Bind(wx.EVT_SPINCTRLDOUBLE, self.OnMaxDistance)
+        self.spin_distance.Bind(wx.EVT_KILL_FOCUS, self.OnMaxDistance)
+        row_dist.Add(self.spin_distance, 0)
+        sz_ef.Add(row_dist, 0, wx.ALL, 2)
 
         self.btn_load_efield = wx.Button(self, -1, _("Load E-field result…"))
         self.btn_load_efield.SetToolTip(
@@ -937,6 +1059,7 @@ class InnerTaskPanel(wx.Panel):
             Publisher.sendMessage("Create surface from index", surface_parameters=surface_params)
 
         self._mask_index_by_name = {name: mask_idx for mask_idx, name in created}
+        self._retarget_on_new_surface = self._efield_loaded
         self._refresh_surface_dropdown()
 
     def _on_coil_pose(self, coord):
@@ -1009,8 +1132,6 @@ class InnerTaskPanel(wx.Panel):
         return arr.reshape(4, 4)
 
     def OnRunSimulation(self, _evt):
-        import invesalius.project as prj
-
         m2m_path = self.txt_m2m.GetValue().strip()
         out_dir = self.txt_sim_out.GetValue().strip()
         coil = self._selected_coil_path().strip()
@@ -1031,15 +1152,6 @@ class InnerTaskPanel(wx.Panel):
         if not m2m_path or not out_dir or not coil:
             wx.MessageBox(
                 _("Please fill in m2m path, output folder, and coil file."),
-                _("Missing input"),
-                wx.ICON_WARNING,
-            )
-            return
-
-        self._refresh_surface_dropdown()
-        if prj.Project().surface_dict and self._selected_surface_index() is None:
-            wx.MessageBox(
-                _("Select the surface to paint the E-field on before running the simulation."),
                 _("Missing input"),
                 wx.ICON_WARNING,
             )
@@ -1159,52 +1271,106 @@ class InnerTaskPanel(wx.Panel):
         self.btn_cancel_sim.Enable(False)
         wx.MessageBox(message, _("SimNIBS error"), wx.ICON_ERROR | wx.OK)
 
-    def OnSurfaceSelect(self, _evt):
-        import invesalius.project as prj
+    def OnSurfaceSelect(self) -> None:
+        """Show the surfaces just ticked, and paint the E-field on them once there is one."""
+        selected = self.combo_surface.GetChecked()
+        self._show_masks_for(selected)
 
-        selected = self.combo_surface.GetStringSelection()
-        index_by_name = {s.name: index for index, s in prj.Project().surface_dict.items()}
+        if not self._efield_loaded:
+            # Still the surface picker with no field loaded; an empty tick list would
+            # mean hiding everything, which is not what clearing it asks for.
+            if selected:
+                Publisher.sendMessage(
+                    TOPIC_SHOW_SURFACES,
+                    index_list=self._surface_indexes(selected),
+                    visibility=True,
+                )
+            return
 
+        try:
+            Publisher.sendMessage(
+                TOPIC_SET_SURFACES,
+                target_surfaces=self._surface_indexes(selected),
+                max_distance=self.spin_distance.GetValue(),
+            )
+        except Exception as exc:  # noqa: BLE001 - report to the user
+            log.exception("SimNIBS E-field could not be painted on the chosen surfaces")
+            wx.MessageBox(str(exc), _("SimNIBS"), wx.ICON_WARNING)
+            # Nothing on screen changed, so put the dropdown back in step with it.
+            self.combo_surface.SetChecked(self._efield_targets)
+
+    def OnMaxDistance(self, evt) -> None:
+        evt.Skip()
+        # Fires on every arrow click and whenever the field loses focus, and each
+        # repaint resamples every target, so only act on a real change.
+        distance = self.spin_distance.GetValue()
+        if not self._efield_loaded or distance == self._painted_distance:
+            return
+        self._painted_distance = distance
+        self.OnSurfaceSelect()
+
+    def _show_masks_for(self, names) -> None:
+        """Show the masks of the ticked tissue surfaces, and hide the rest."""
         for name, mask_index in self._mask_index_by_name.items():
-            visible = name == selected
-            index = index_by_name.get(name)
-            if index is not None:
-                Publisher.sendMessage("Show surface", index=index, visibility=visible)
-            Publisher.sendMessage("Show mask", index=mask_index, value=visible)
-
-        selected_mask_index = self._mask_index_by_name.get(selected)
-        if selected_mask_index is not None:
-            Publisher.sendMessage("Change mask selected", index=selected_mask_index)
+            Publisher.sendMessage("Show mask", index=mask_index, value=name in names)
+        if len(names) == 1 and names[0] in self._mask_index_by_name:
+            Publisher.sendMessage("Change mask selected", index=self._mask_index_by_name[names[0]])
 
     def _refresh_surface_dropdown(self, _evt=None) -> None:
-        """List every surface in the project, keeping the current selection."""
+        """List every surface in the project, keeping whichever are ticked."""
         import invesalius.project as prj
 
-        selected = self.combo_surface.GetStringSelection()
-        names = [str(s.name) for s in prj.Project().surface_dict.values()]
+        self.combo_surface.SetSurfaces([str(s.name) for s in prj.Project().surface_dict.values()])
 
-        self.combo_surface.Clear()
-        for name in names:
-            self.combo_surface.Append(name)
-
-        if selected in names:
-            self.combo_surface.SetStringSelection(selected)
-        elif names:
-            self.combo_surface.SetSelection(0)
-
-    def _selected_surface_index(self):
-        """Project index of the surface to paint the E-field on, or None."""
+    def _surface_indexes(self, names) -> list:
         import invesalius.project as prj
 
-        surface_dict = prj.Project().surface_dict
-        if not surface_dict:
-            return None
+        wanted = set(names)
+        return [
+            index
+            for index, surface in prj.Project().surface_dict.items()
+            if str(surface.name) in wanted
+        ]
 
-        selected = self.combo_surface.GetStringSelection()
-        for index, surface in surface_dict.items():
-            if str(surface.name) == selected:
-                return index
-        return None
+    def _on_efield_painted(self, painted, refused) -> None:
+        self._efield_loaded = True
+        self._efield_targets = [name for _index, name, _coverage in painted]
+
+        self._refresh_surface_dropdown()
+        if not self.combo_surface.GetChecked():
+            self.combo_surface.SetChecked(self._efield_targets)
+
+        visible = set(self.combo_surface.GetChecked()) | set(self._efield_targets)
+        Publisher.sendMessage(
+            TOPIC_SHOW_SURFACES, index_list=self._surface_indexes(visible), visibility=True
+        )
+
+        summary = ", ".join(f"{name} ({coverage:.0%})" for _index, name, coverage in painted)
+        if refused:
+            skipped = ", ".join(
+                name if closest is None else f"{name} {closest:.0f} mm away"
+                for name, closest in refused
+            )
+            summary += _(" — out of reach: {}").format(skipped)
+        self.lbl_efield.SetLabel(_("E-field on {}").format(summary))
+
+    def _on_surface_added(self, surface) -> None:
+        """A surface finished generating, which happens well after the import is asked for."""
+        self._refresh_surface_dropdown()
+        if not self._efield_loaded:
+            return
+
+        name = str(surface.name)
+        if self._retarget_on_new_surface and simnibs_efield.IsDefaultTarget(name):
+            self._retarget_on_new_surface = False
+            self.combo_surface.SetChecked([name])
+            self.OnSurfaceSelect()
+        else:
+            Publisher.sendMessage(
+                TOPIC_SHOW_SURFACES,
+                index_list=self._surface_indexes(self._efield_targets),
+                visibility=True,
+            )
 
     def OnColormap(self, _evt):
         Publisher.sendMessage(TOPIC_SET_COLORMAP, colormap=self.combo_cmap.GetValue())
@@ -1259,26 +1425,16 @@ class InnerTaskPanel(wx.Panel):
         )
 
     def _load_efield_result(self, filepath: str) -> None:
-        import invesalius.project as prj
-
         self._refresh_surface_dropdown()
-        surface_index = self._selected_surface_index()
-        if surface_index is None and prj.Project().surface_dict:
-            wx.MessageBox(
-                _("Select the surface to paint the E-field on first."),
-                _("SimNIBS"),
-                wx.ICON_WARNING,
-            )
-            return
-
         try:
             Publisher.sendMessage(
                 TOPIC_LOAD_RESULT,
                 filepath=filepath,
-                surface_index=surface_index,
+                target_surfaces=self._surface_indexes(self.combo_surface.GetChecked()),
                 colormap=self.combo_cmap.GetValue(),
                 threshold=self._threshold(),
                 opacity=self.spin_opacity.GetValue(),
+                max_distance=self.spin_distance.GetValue(),
             )
         except Exception as exc:  # noqa: BLE001 - report to the user
             log.exception("SimNIBS E-field surface could not be loaded")
@@ -1287,8 +1443,13 @@ class InnerTaskPanel(wx.Panel):
                 _("SimNIBS"),
                 wx.ICON_ERROR,
             )
-            return
-        self.lbl_efield.SetLabel(_("E-field loaded: {}").format(os.path.basename(filepath)))
 
     def OnRemove(self, _evt):
-        Publisher.sendMessage(TOPIC_REMOVE_EFIELD)
+        try:
+            Publisher.sendMessage(TOPIC_REMOVE_EFIELD)
+        finally:
+            self._efield_loaded = False
+            self._efield_targets = []
+            self._retarget_on_new_surface = False
+            self.combo_surface.SetChecked([])
+            self.lbl_efield.SetLabel(_("No E-field loaded."))
