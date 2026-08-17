@@ -1881,7 +1881,7 @@ class RobotButtonsPanel(wx.Panel):
     making it self-contained and reusable.
     """
 
-    def __init__(self, parent, robot, navigation):
+    def __init__(self, parent, robot, navigation, show_label=False):
         wx.Panel.__init__(self, parent)
 
         self.robot = robot
@@ -1889,8 +1889,8 @@ class RobotButtonsPanel(wx.Panel):
 
         # State variables (maintained via Publisher subscriptions)
         self.nav_status = False
-        self.target_selected = False
-        self.target_mode = False
+        self.target_selected = self.robot.target is not None
+        self.target_mode = self.robot.target is not None
 
         # Constants
         ICON_SIZE = (48, 48)
@@ -1975,8 +1975,8 @@ class RobotButtonsPanel(wx.Panel):
         self.robot_reset_errors_button = robot_reset_errors_button
 
         # Sizer
-        sizer = wx.FlexGridSizer(4, 5, 5)
-        sizer.AddMany(
+        buttons_sizer = wx.FlexGridSizer(4, 5, 5)
+        buttons_sizer.AddMany(
             [
                 (robot_track_target_button),
                 (robot_move_away_button),
@@ -1984,9 +1984,30 @@ class RobotButtonsPanel(wx.Panel):
                 (robot_reset_errors_button),
             ]
         )
-        self.SetSizer(sizer)
+
+        label_text = f"Robot {self.robot.robot_id}"
+        if getattr(self.robot, "coil_name", None):
+            label_text += f" - {self.robot.coil_name}"
+
+        self.label = wx.StaticText(self, -1, label_text)
+        font = self.label.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        self.label.SetFont(font)
+
+        if not show_label:
+            self.label.Hide()
+
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        main_sizer.Add(self.label, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 5)
+        main_sizer.Add(buttons_sizer, 0, wx.ALIGN_CENTER_HORIZONTAL)
+
+        self.SetSizer(main_sizer)
 
         self.__bind_events()
+
+    def ShowLabel(self, show=True):
+        self.label.Show(show)
+        self.Layout()
 
     def __bind_events(self):
         # State tracking subscriptions
@@ -2151,7 +2172,7 @@ class ControlPanel(wx.Panel):
 
         self.navigation = nav_hub.navigation
         self.tracker = nav_hub.tracker
-        self.robot = nav_hub.robot
+        self.robots = nav_hub.robots
         self.icp = nav_hub.icp
         self.image = nav_hub.image
         self.mep_visualizer = nav_hub.mep_visualizer
@@ -2315,8 +2336,9 @@ class ControlPanel(wx.Panel):
         self.target_mode_button = target_mode_button
         self.UpdateTargetButton()
 
-        # Robot buttons panel
-        self.robot_buttons_panel = RobotButtonsPanel(scroll_panel, self.robot, self.navigation)
+        # Robot buttons panels
+        self.robot_panels = {}
+        self.robots_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Toggle button for displaying TMS motor mapping on brain
         tooltip = _("Show TMS motor mapping on brain")
@@ -2362,7 +2384,7 @@ class ControlPanel(wx.Panel):
 
         scroll_sizer = wx.BoxSizer(wx.VERTICAL)
         scroll_sizer.Add(navigation_buttons_sizer, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.ALL, 10)
-        scroll_sizer.Add(self.robot_buttons_panel, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 10)
+        scroll_sizer.Add(self.robots_sizer, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 10)
         scroll_panel.SetSizer(scroll_sizer)
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -2387,6 +2409,8 @@ class ControlPanel(wx.Panel):
         Publisher.subscribe(self.SetTarget, "Set target")
         Publisher.subscribe(self.UnsetTarget, "Unset target")
         Publisher.subscribe(self.UpdateNavigationStatus, "Navigation status")
+
+        Publisher.subscribe(self.OnRobotAdded, "Robot added")
 
         Publisher.subscribe(self.UpdateTractsVisualization, "Update tracts visualization")
 
@@ -2468,7 +2492,7 @@ class ControlPanel(wx.Panel):
             self.navigation.StartNavigation(self.tracker, self.icp)
 
             # Ensure that the target is sent to robot when navigation starts.
-            self.robot.SendTargetToRobot()
+            self.robots.SendTargetToAll()
 
     def OnStartNavigationButton(self, evt, btn_nav):
         nav_id = btn_nav.GetValue()
@@ -2490,7 +2514,7 @@ class ControlPanel(wx.Panel):
         Publisher.sendMessage("Disable style", style=const.STATE_NAVIGATION)
 
         # Set robot objective to NONE when stopping navigation.
-        self.robot.SetObjective(RobotObjective.NONE)
+        self.robots.SetNoneObjectiveToAll()
 
         self.navigation.StopNavigation()
 
@@ -2715,6 +2739,20 @@ class ControlPanel(wx.Panel):
         if self.mep_visualizer.DisplayMotorMap(show=pressed):
             self.UpdateToggleButton(self.show_motor_map_button)
 
+    def OnRobotAdded(self, robot):
+        show_labels = len(self.robot_panels) > 0
+        panel = RobotButtonsPanel(self.scroll_panel, robot, self.navigation, show_label=show_labels)
+        self.robot_panels[robot.robot_id] = panel
+        self.robots_sizer.Add(panel, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 10)
+
+        if show_labels:
+            for p in self.robot_panels.values():
+                p.ShowLabel(True)
+
+        self.scroll_panel.Layout()
+        self.Layout()
+        self.Refresh()
+
 
 class MarkersPanel(wx.Panel, ColumnSorterMixin):
     def __init__(self, parent, nav_hub):
@@ -2729,7 +2767,6 @@ class MarkersPanel(wx.Panel, ColumnSorterMixin):
 
         self.navigation = nav_hub.navigation
         self.markers = nav_hub.markers
-        self.robot = nav_hub.robot
         self.robots = nav_hub.robots
 
         if has_mTMS:
@@ -2815,11 +2852,7 @@ class MarkersPanel(wx.Panel, ColumnSorterMixin):
         sizer_delete.AddMany([(btn_delete_single, 1, wx.RIGHT), (btn_delete_all, 0, wx.LEFT)])
 
         # Combobox for choosing the main coil (ie. the coil which to track with pointer and to use for marker creation)
-        robot_coil = self.robot.GetCoilName()
-        init_choices = [
-            f"{coil} (robot)" if coil == robot_coil else coil
-            for coil in self.navigation.coil_registrations
-        ]
+        init_choices = self.GetMainCoilComboboxChoices()
 
         self.select_main_coil = select_main_coil = wx.ComboBox(
             self,
@@ -3686,31 +3719,33 @@ class MarkersPanel(wx.Panel, ColumnSorterMixin):
                 wx.MessageBox(str(e), _("InVesalius 3"), wx.OK | wx.ICON_ERROR)
         grid_dlg.Destroy()
 
+    def GetMainCoilComboboxChoices(self):
+        coil_to_robots = {}
+        if hasattr(self, "robots") and self.robots is not None:
+            for r_id, r in self.robots.robots_by_id.items():
+                if not r.IsConnected():
+                    continue
+                r_coil = r.GetCoilName()
+                if r_coil:
+                    if r_coil not in coil_to_robots:
+                        coil_to_robots[r_coil] = []
+                    coil_to_robots[r_coil].append(str(r_id))
+
+        choices = []
+        for coil in self.navigation.coil_registrations:
+            if coil in coil_to_robots:
+                r_str = ", ".join(coil_to_robots[coil])
+                choices.append(f"{coil} (robot {r_str})")
+            else:
+                choices.append(coil)
+        return choices
+
     def UpdateMainCoilCombobox(self, done):
         select_main_coil = self.select_main_coil
         if done:
             select_main_coil.Clear()
 
-            coil_to_robots = {}
-            if hasattr(self, "robots") and self.robots is not None:
-                for r_id, r in self.robots.robots_by_id.items():
-                    r_coil = r.GetCoilName()
-                    if r_coil:
-                        if r_coil not in coil_to_robots:
-                            coil_to_robots[r_coil] = []
-                        coil_to_robots[r_coil].append(str(r_id))
-            elif hasattr(self, "robot") and self.robot is not None:
-                r_coil = self.robot.GetCoilName()
-                if r_coil:
-                    coil_to_robots[r_coil] = ["0"]
-
-            choices = []
-            for coil in self.navigation.coil_registrations:
-                if coil in coil_to_robots:
-                    r_str = ", ".join(coil_to_robots[coil])
-                    choices.append(f"{coil} (robot {r_str})")
-                else:
-                    choices.append(coil)
+            choices = self.GetMainCoilComboboxChoices()
 
             select_main_coil.AppendItems(choices)
             try:
@@ -3737,6 +3772,8 @@ class MarkersPanel(wx.Panel, ColumnSorterMixin):
         elif main_coil.endswith(" (robot)"):
             main_coil = main_coil[:-8]
         self.navigation.SetMainCoil(main_coil)
+        self.robots.SetMainCoil(main_coil)
+
         ctrl.SetSelection(choice)
         Publisher.sendMessage("Update robot buttons")
 

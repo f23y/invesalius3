@@ -7119,6 +7119,7 @@ class RobotCoregistrationDialog(wx.Dialog):
         Publisher.sendMessage(
             "Neuronavigation to Robot: Collect coordinates for the robot transformation matrix",
             data=None,
+            robot_id=self.robot.robot_id,
         )
 
     def GetAcquiredPoints(self) -> int:
@@ -7144,6 +7145,7 @@ class RobotCoregistrationDialog(wx.Dialog):
         Publisher.sendMessage(
             "Neuronavigation to Robot: Reset coordinates collection for the robot transformation matrix",
             data=None,
+            robot_id=self.robot.robot_id,
         )
 
         self.StopContinuousAcquisition()
@@ -7159,7 +7161,9 @@ class RobotCoregistrationDialog(wx.Dialog):
         self.StopContinuousAcquisition()
 
         Publisher.sendMessage(
-            "Neuronavigation to Robot: Estimate robot transformation matrix", data=None
+            "Neuronavigation to Robot: Estimate robot transformation matrix",
+            data=None,
+            robot_id=self.robot.robot_id,
         )
 
         self.btn_save.Enable(True)
@@ -7213,6 +7217,7 @@ class RobotCoregistrationDialog(wx.Dialog):
         Publisher.sendMessage(
             "Neuronavigation to Robot: Set robot transformation matrix",
             data=self.matrix_tracker_to_robot.tolist(),
+            robot_id=self.robot.robot_id,
         )
 
         # Enable 'Ok' button if connection to robot is ok.

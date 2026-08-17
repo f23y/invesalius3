@@ -108,6 +108,7 @@ from invesalius.data.visualization.vector_field_visualizer import VectorFieldVis
 from invesalius.gui.widgets.canvas_renderer import CanvasRendererCTX
 from invesalius.i18n import tr as _
 from invesalius.math_utils import inner1d
+from invesalius.navigation.robot import Robots
 from invesalius.pubsub import pub as Publisher
 
 if sys.platform == "win32":
@@ -342,6 +343,7 @@ class Viewer(wx.Panel):
 
         self.probe_visualizer = ProbeVisualizer(self.ren)
         self.robot_force_visualizer = RobotForceVisualizer(self.interactor)
+        self.robots = Robots()
 
         self.seed_offset = const.SEED_OFFSET
         self.radius_list = vtkIdList()
@@ -1429,11 +1431,6 @@ class Viewer(wx.Panel):
             displacement_to_target_robot = dcr.ComputeRelativeDistanceToTarget(
                 target_coord=self.target_coord, m_img=m_img_flip
             )
-            wx.CallAfter(
-                Publisher.sendMessage,
-                "Neuronavigation to Robot: Update displacement to target",
-                displacement=displacement_to_target_robot,
-            )
 
             distance_to_target = displacement_to_target_robot.copy()
             if distance_to_target[3] > const.ARROW_UPPER_LIMIT:
@@ -1496,9 +1493,12 @@ class Viewer(wx.Panel):
             )
 
             wx.CallAfter(Publisher.sendMessage, "Coil at target", state=coil_at_target)
-            wx.CallAfter(
-                Publisher.sendMessage, "From Neuronavigation: Coil at target", state=coil_at_target
-            )
+
+            robot_active = self.robots.GetActiveRobot()
+            # If robot is active, send status and update displacement to target
+            if robot_active:
+                robot_active.SendStatusCoilAtTarget(coil_at_target)
+                robot_active.UpdateDisplacementToTarget(displacement_to_target_robot)
 
             guide_signature = (
                 int(round(coordrx_arrow / self._target_guide_deadband)),

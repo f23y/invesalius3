@@ -92,6 +92,7 @@ class TrackerCoordinates:
             "From Neuronavigation: Update tracker poses",
             poses=poses,
             visibilities=visibilities,
+            robot_id=-1,
         )
 
     def _dispatch_sensors_update(self) -> None:

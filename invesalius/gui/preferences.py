@@ -52,16 +52,7 @@ class Preferences(wx.Dialog):
         if mode == const.MODE_NAVIGATOR:
             tracker = Tracker()
             robots = Robots()
-            # If the robot is not initialized yet (maybe NavigationHub hasn't run),
-            # this gets the first robot or creates one.
-            if len(robots.robots_by_id) == 0:
-                robots.AddRobot(
-                    tracker=tracker,
-                    navigation=Navigation(
-                        pedal_connector=None, neuronavigation_api=NeuronavigationApi()
-                    ),
-                    icp=None,
-                )
+
             neuronavigation_api = NeuronavigationApi()
             pedal_connector = PedalConnector(neuronavigation_api, self)
             navigation = Navigation(
@@ -1022,10 +1013,6 @@ class ObjectTab(wx.Panel):
         self.navigation = navigation
         self.robots = robots
 
-        # Ensure at least two robots exist for the UI
-        while len(self.robots.robots_by_id) < 2:
-            self.robots.AddRobot(tracker=self.tracker, navigation=self.navigation, icp=None)
-
         self.robot_0 = self.robots.GetRobot(0)
         self.robot_1 = self.robots.GetRobot(1)
         self.coil_registrations = {}
@@ -1164,10 +1151,11 @@ class ObjectTab(wx.Panel):
 
         # Robot 0
         self.robot_0_lbl = wx.StaticText(self, -1, _("Robot 0 is connected. Coil attached: "))
+        coil_name_0 = self.robot_0.GetCoilName() or ""
         self.choice_robot_0_coil = wx.ComboBox(
             self,
             -1,
-            f"{self.robot_0.GetCoilName() or ''}",
+            f"{coil_name_0}",
             size=wx.Size(90, 23),
             choices=list(self.navigation.coil_registrations),
             style=wx.CB_DROPDOWN | wx.CB_READONLY,
@@ -1183,10 +1171,11 @@ class ObjectTab(wx.Panel):
 
         # Robot 1
         self.robot_1_lbl = wx.StaticText(self, -1, _("Robot 1 is connected. Coil attached: "))
+        coil_name_1 = self.robot_1.GetCoilName() if self.robot_1 else ""
         self.choice_robot_1_coil = wx.ComboBox(
             self,
             -1,
-            f"{self.robot_1.GetCoilName() or ''}",
+            f"{coil_name_1}",
             size=wx.Size(90, 23),
             choices=list(self.navigation.coil_registrations),
             style=wx.CB_DROPDOWN | wx.CB_READONLY,
@@ -1196,7 +1185,7 @@ class ObjectTab(wx.Panel):
             wx.EVT_COMBOBOX, lambda evt: self.OnChoiceRobotCoil(evt, self.robot_1)
         )
 
-        if not self.robot_1.IsConnected():
+        if not self.robot_1 or not self.robot_1.IsConnected():
             self.robot_1_lbl.SetLabel("Robot 1 is not connected")
             self.choice_robot_1_coil.Show(False)
 
@@ -1231,27 +1220,36 @@ class ObjectTab(wx.Panel):
         Publisher.subscribe(self.OnEnableRobot, "Enable robot")
 
     def OnEnableRobot(self, enabled=False, robot_id=None):
+        show_multicoil = self.navigation.n_coils > 1
+
         if robot_id == 0:
             if enabled:
-                self.choice_robot_0_coil.Show(True)
+                self.choice_robot_0_coil.Show(show_multicoil)
                 self.robot_0_lbl.SetLabel("Robot 0 is connected. Coil attached: ")
+                if self.robot_0 and self.robot_0.GetCoilName():
+                    self.choice_robot_0_coil.SetValue(self.robot_0.GetCoilName())
             else:
                 self.choice_robot_0_coil.Show(False)
-                self.choice_robot_0_coil.SetSelection(wx.NOT_FOUND)
                 self.robot_0_lbl.SetLabel("Robot 0 is not connected.")
         elif robot_id == 1:
+            if not self.robot_1:
+                self.robot_1 = self.robots.GetRobot(1)
+
             if enabled:
-                self.choice_robot_1_coil.Show(True)
+                self.choice_robot_1_coil.Show(show_multicoil)
                 self.robot_1_lbl.SetLabel("Robot 1 is connected. Coil attached: ")
+                if self.robot_1 and self.robot_1.GetCoilName():
+                    self.choice_robot_1_coil.SetValue(self.robot_1.GetCoilName())
             else:
                 self.choice_robot_1_coil.Show(False)
-                self.choice_robot_1_coil.SetSelection(wx.NOT_FOUND)
                 self.robot_1_lbl.SetLabel("Robot 1 is not connected.")
         self.Layout()
 
     def OnChoiceRobotCoil(self, event, robot):
+        if not robot:
+            return
         robot_coil_name = event.GetEventObject().GetStringSelection()
-        robot.SetCoilName(robot_coil_name)
+        self.robots.AssignCoilToRobot(robot.robot_id, robot_coil_name)
         Publisher.sendMessage("Coil selection done", done=True)
         Publisher.sendMessage("Update robot buttons")
 
@@ -1370,7 +1368,9 @@ class ObjectTab(wx.Panel):
         if hasattr(self, "choice_robot_0_coil"):
             self.choice_robot_0_coil.Show(show_multicoil and self.robot_0.IsConnected())
         if hasattr(self, "choice_robot_1_coil"):
-            self.choice_robot_1_coil.Show(show_multicoil and self.robot_1.IsConnected())
+            self.choice_robot_1_coil.Show(
+                show_multicoil and self.robot_1 is not None and self.robot_1.IsConnected()
+            )
 
         self.Layout()
 
@@ -1378,6 +1378,9 @@ class ObjectTab(wx.Panel):
         multicoil_mode = n_coils > 1
 
         if multicoil_mode:
+            if not self.robot_1:
+                self.robot_1 = self.robots.GetRobot(1)
+
             # Update multicoil GUI elements
             self.sel_sizer.GetStaticBox().SetLabel(f"TMS coil selection (0 out of {n_coils})")
 
@@ -1450,7 +1453,7 @@ class ObjectTab(wx.Panel):
         if self.navigation.n_coils == 1:  # Tell the robot the coil name
             coil_name = next(iter(self.navigation.coil_registrations))
             if hasattr(self, "robot_0"):
-                self.robot_0.SetCoilName(coil_name)
+                self.robots.AssignCoilToRobot(self.robot_0.robot_id, coil_name)
 
         Publisher.sendMessage("Coil selection done", done=True)
         Publisher.sendMessage("Update status text in GUI", label=_("Ready"))
@@ -1527,7 +1530,7 @@ class ObjectTab(wx.Panel):
         # Update robot coil combobox
         if hasattr(self, "choice_robot_0_coil") and self.choice_robot_0_coil is not None:
             self.choice_robot_0_coil.Set(list(navigation.coil_registrations))
-            coil_0 = self.robot_0.GetCoilName()
+            coil_0 = self.robot_0.GetCoilName() if self.robot_0.IsConnected() else None
             if coil_0 and coil_0 in navigation.coil_registrations:
                 self.choice_robot_0_coil.SetStringSelection(coil_0)
             else:
@@ -1535,7 +1538,9 @@ class ObjectTab(wx.Panel):
 
         if hasattr(self, "choice_robot_1_coil") and self.choice_robot_1_coil is not None:
             self.choice_robot_1_coil.Set(list(navigation.coil_registrations))
-            coil_1 = self.robot_1.GetCoilName()
+            coil_1 = (
+                self.robot_1.GetCoilName() if self.robot_1 and self.robot_1.IsConnected() else None
+            )
             if coil_1 and coil_1 in navigation.coil_registrations:
                 self.choice_robot_1_coil.SetStringSelection(coil_1)
             else:
@@ -2321,23 +2326,20 @@ class TrackerTab(wx.Panel):
         tracker_sizer = wx.StaticBoxSizer(wx.VERTICAL, self, _("Setup tracker"))
         tracker_sizer.Add(ref_sizer, 1, wx.ALL | wx.FIXED_MINSIZE, 20)
 
-        # Ensure at least two robots exist in Robots manager for the UI
-        while len(self.robots.robots_by_id) < 2:
-            self.robots.AddRobot(tracker=self.tracker, navigation=self.navigation, icp=None)
-
         robot_0 = self.robots.GetRobot(0)
-        robot_1 = self.robots.GetRobot(1)
 
         # Robot setup panel (child component) for ID 0
         self.robot_setup_panel_0 = RobotSetupPanel(self, robot_0)
 
-        # Robot setup panel (child component) for ID 1
-        self.robot_setup_panel_1 = RobotSetupPanel(self, robot_1)
+        self.robot_setup_panel_1 = None
+        if len(self.robots.robots_by_id) > 1:
+            self.robot_setup_panel_1 = RobotSetupPanel(self, self.robots.GetRobot(1))
 
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         main_sizer.Add(tracker_sizer, 0, wx.ALL | wx.EXPAND, 7)
         main_sizer.Add(self.robot_setup_panel_0, 0, wx.ALL | wx.EXPAND, 0)
-        main_sizer.Add(self.robot_setup_panel_1, 0, wx.ALL | wx.EXPAND, 0)
+        if self.robot_setup_panel_1:
+            main_sizer.Add(self.robot_setup_panel_1, 0, wx.ALL | wx.EXPAND, 0)
 
         self.main_sizer = main_sizer
         self.SetSizerAndFit(main_sizer)
@@ -2414,9 +2416,17 @@ class TrackerTab(wx.Panel):
 
     def UpdateRobotPanelsVisibility(self):
         if self.n_coils > 1:
-            self.main_sizer.Show(self.robot_setup_panel_1)
+            if len(self.robots.robots_by_id) < 2:
+                self.robots.AddRobot(tracker=self.tracker, navigation=self.navigation, icp=None)
+
+            if not getattr(self, "robot_setup_panel_1", None):
+                self.robot_setup_panel_1 = RobotSetupPanel(self, self.robots.GetRobot(1))
+                self.main_sizer.Add(self.robot_setup_panel_1, 0, wx.ALL | wx.EXPAND, 0)
+
+            self.robot_setup_panel_1.Show()
         else:
-            self.main_sizer.Hide(self.robot_setup_panel_1)
+            if getattr(self, "robot_setup_panel_1", None):
+                self.robot_setup_panel_1.Hide()
 
         self.Layout()
         if self.GetParent():

@@ -62,18 +62,26 @@ class NavigationHub(metaclass=Singleton):
         self.icp = IterativeClosestPoint()
         self.neuronavigation_api = NeuronavigationApi()
         self.pedal_connector = PedalConnector(self.neuronavigation_api, window)
-        self.navigation = Navigation(
-            pedal_connector=self.pedal_connector, neuronavigation_api=self.neuronavigation_api
-        )
         self.robots = Robots()
-        # Initialize the first robot by default
-        if len(self.robots.robots_by_id) == 0:
-            self.robot = self.robots.AddRobot(
+        self.navigation = Navigation(
+            pedal_connector=self.pedal_connector,
+            neuronavigation_api=self.neuronavigation_api,
+        )
+
+        session = ses.Session()
+        n_coils = session.GetConfig("navigation", {}).get("n_coils", 1)
+
+        # Initialize the robots based on number of coils config
+        while len(self.robots.robots_by_id) < n_coils:
+            robot = self.robots.AddRobot(
                 tracker=self.tracker,
                 navigation=self.navigation,
                 icp=self.icp,
             )
-        self.markers = MarkersControl(robot=self.robot)
+            # Break when we have 2 robots
+            if len(self.robots.robots_by_id) == 2:
+                break
+        self.markers = MarkersControl()
         self.mep_visualizer = MEPVisualizer()
         Publisher.sendMessage("Add navigation context to interactive shell")
 
