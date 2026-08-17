@@ -65,9 +65,8 @@ TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
 TOPIC_SET_TARGET = "Set target"
 TOPIC_UNSET_TARGET = "Unset target"
 
-_AXES_INV_TO_SIMNIBS = (
-    tr.euler_matrix(0, 0, np.radians(-90))[:3, :3] @ tr.euler_matrix(np.radians(180), 0, 0)[:3, :3]
-)
+# Columns = SimNIBS coil axes in InVesalius ones: y is +x (away from handle), z is -z (into head).
+_AXES_INV_TO_SIMNIBS = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
 
 
 def _find_charm() -> str | None:
