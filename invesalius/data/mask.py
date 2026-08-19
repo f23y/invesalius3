@@ -31,7 +31,6 @@ from scipy import ndimage
 import invesalius.constants as const
 import invesalius.data.converters as converters
 import invesalius.session as ses
-import invesalius.utils as utils
 import invesalius_rs as floodfill
 from invesalius.data.volume_mask import VolumeMask
 from invesalius.pubsub import pub as Publisher
@@ -75,6 +74,77 @@ class EditionHistoryNode:
         os.remove(self.filename)
 
 
+class DeltaHistoryNode:
+    """Memory-efficient, delta-encoded history node for 3D volume mask operations.
+
+    Instead of duplicating full 3D volume matrices (~125 MB each), DeltaHistoryNode
+    stores only the coordinates and values of voxels that were modified.
+    """
+
+    def __init__(self, index, orientation, p_array, array, tool_id="VOLUME", clean=False):
+        self.index = index
+        self.orientation = orientation
+        self.tool_id = tool_id
+        self.clean = clean
+        self.is_delta = True
+
+        diff = np.where(p_array != array)
+        self.indices = diff
+        self.old_values = p_array[diff]
+        self.new_values = array[diff]
+
+        self.fd = None
+        self.filename = None
+
+    def serialize_to_disk(self):
+        """Compresses and writes delta arrays to a temporary file for crash recovery / memory spillover."""
+        if self.filename is None and self.indices is not None and len(self.indices[0]) > 0:
+            self.fd, self.filename = tempfile.mkstemp(suffix=".npz")
+            np.savez_compressed(
+                self.filename,
+                z=self.indices[0],
+                y=self.indices[1],
+                x=self.indices[2],
+                old_values=self.old_values,
+                new_values=self.new_values,
+            )
+            self.indices = None
+            self.old_values = None
+            self.new_values = None
+
+    def _ensure_in_memory(self):
+        """De-serializes delta arrays back into memory if they were spilled to disk."""
+        if self.indices is None and self.filename is not None and os.path.exists(self.filename):
+            data = np.load(self.filename)
+            self.indices = (data["z"], data["y"], data["x"])
+            self.old_values = data["old_values"]
+            self.new_values = data["new_values"]
+
+    def apply_undo(self, mvolume):
+        self._ensure_in_memory()
+        if self.indices is not None and len(self.indices[0]) > 0:
+            mvolume[self.indices] = self.old_values
+
+    def apply_redo(self, mvolume):
+        self._ensure_in_memory()
+        if self.indices is not None and len(self.indices[0]) > 0:
+            mvolume[self.indices] = self.new_values
+
+    def commit_history(self, mvolume):
+        self.apply_redo(mvolume)
+
+    def __del__(self):
+        if self.filename is not None and os.path.exists(self.filename):
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            try:
+                os.remove(self.filename)
+            except OSError:
+                pass
+
+
 class EditionHistory:
     def __init__(self, size=50):
         self.history = []
@@ -85,12 +155,16 @@ class EditionHistory:
         Publisher.sendMessage("Enable redo", value=False)
 
     def new_node(self, index, orientation, array, p_array, clean):
-        # Saving the previous state, used to undo/redo correctly.
-        p_node = EditionHistoryNode(index, orientation, p_array, clean)
-        self.add(p_node)
+        if orientation == "VOLUME":
+            node = DeltaHistoryNode(index, orientation, p_array, array, clean=clean)
+            self.add(node)
+        else:
+            # Saving the previous state, used to undo/redo correctly for 2D slices.
+            p_node = EditionHistoryNode(index, orientation, p_array, clean)
+            self.add(p_node)
 
-        node = EditionHistoryNode(index, orientation, array, clean)
-        self.add(node)
+            node = EditionHistoryNode(index, orientation, array, clean)
+            self.add(node)
 
     def add(self, node):
         if self.index == self.size:
@@ -108,22 +182,27 @@ class EditionHistory:
 
     def undo(self, mvolume, actual_slices=None):
         h = self.history
-        if self.index > 0:
-            # if self.index > 0 and h[self.index].clean:
-            ##self.index -= 1
-            ##h[self.index].commit_history(mvolume)
-            # self._reload_slice(self.index - 1)
-            if h[self.index - 1].orientation == "VOLUME":
+        if self.index >= 0:
+            current_node = h[self.index]
+            if isinstance(current_node, DeltaHistoryNode):
+                current_node.apply_undo(mvolume)
+                self.index -= 1
+                if self.index < 0:
+                    Publisher.sendMessage("Enable undo", value=False)
+                Publisher.sendMessage("Enable redo", value=True)
+                return
+            elif self.index > 0 and h[self.index - 1].orientation == "VOLUME":
                 self.index -= 1
                 h[self.index].commit_history(mvolume)
                 self._reload_slice(self.index)
                 Publisher.sendMessage("Enable redo", value=True)
             elif (
-                actual_slices
+                self.index > 0
+                and actual_slices
                 and actual_slices[h[self.index - 1].orientation] != h[self.index - 1].index
             ):
                 self._reload_slice(self.index - 1)
-            else:
+            elif self.index > 0:
                 self.index -= 1
                 h[self.index].commit_history(mvolume)
                 if (
@@ -136,19 +215,29 @@ class EditionHistory:
                 self._reload_slice(self.index)
                 Publisher.sendMessage("Enable redo", value=True)
 
-        if self.index == 0:
+        if self.index < 0:
             Publisher.sendMessage("Enable undo", value=False)
-        print("AT", self.index, len(self.history), self.history[self.index].filename)
+        print(
+            "AT",
+            self.index,
+            len(self.history),
+            self.history[self.index].filename
+            if hasattr(self.history[self.index], "filename")
+            else self.history[self.index],
+        )
 
     def redo(self, mvolume, actual_slices=None):
         h = self.history
         if self.index < len(h) - 1:
-            # if self.index < len(h) - 1 and h[self.index].clean:
-            ##self.index += 1
-            ##h[self.index].commit_history(mvolume)
-            # self._reload_slice(self.index + 1)
-
-            if h[self.index + 1].orientation == "VOLUME":
+            next_node = h[self.index + 1]
+            if isinstance(next_node, DeltaHistoryNode):
+                self.index += 1
+                next_node.apply_redo(mvolume)
+                if self.index == len(h) - 1:
+                    Publisher.sendMessage("Enable redo", value=False)
+                Publisher.sendMessage("Enable undo", value=True)
+                return
+            elif h[self.index + 1].orientation == "VOLUME":
                 self.index += 1
                 h[self.index].commit_history(mvolume)
                 self._reload_slice(self.index)
@@ -268,16 +357,34 @@ class Mask:
         self.history.new_node(index, orientation, array, p_array, clean)
 
     def undo_history(self, actual_slices):
+        import invesalius.data.slice_ as slc
+
         self.history.undo(self.matrix, actual_slices)
-        self.modified()
+        self.modified_time = time.monotonic()
+
+        slc.Slice().discard_all_buffers()
+        if self.volume is not None and ses.Session().mask_3d_preview:
+            self._update_imagedata(update_volume_viewer=True)
+
+        Publisher.sendMessage("Update slice viewer")
+        Publisher.sendMessage("Reload actual slice")
 
         # Marking the project as changed
         session = ses.Session()
         session.ChangeProject()
 
     def redo_history(self, actual_slices):
+        import invesalius.data.slice_ as slc
+
         self.history.redo(self.matrix, actual_slices)
-        self.modified()
+        self.modified_time = time.monotonic()
+
+        slc.Slice().discard_all_buffers()
+        if self.volume is not None and ses.Session().mask_3d_preview:
+            self._update_imagedata(update_volume_viewer=True)
+
+        Publisher.sendMessage("Update slice viewer")
+        Publisher.sendMessage("Reload actual slice")
 
         # Marking the project as changed
         session = ses.Session()

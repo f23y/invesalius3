@@ -54,6 +54,8 @@ class Mask3DEditorState:
         sub(self.SetDepthValue, "M3E set depth value")
         sub(self.SetBrushSize, "Set edition brush size")
         sub(self.OnMaskChanged, "Change mask selected")
+        sub(self.OnSliceReloaded, "Reload actual slice")
+        sub(self.OnSliceReloaded, "Update slice viewer")
 
     def setup_state(self):
         """Called when the editor is activated."""
@@ -218,9 +220,13 @@ class Mask3DEditorState:
         wts = self.world_to_screen
         wtc = self.world_to_camera_coordinates
 
+        orig_mask = self.mask_data.copy()
         mask_cut(_mat, sx, sy, sz, depth, filter, wts, wtc, out, self.edit_mode)  # type: ignore
 
         self.mask_data[1:, 1:, 1:] = out
+        cur_mask = slc.Slice().current_mask
+        if cur_mask is not None:
+            cur_mask.save_history(0, "VOLUME", self.mask_data, orig_mask)
         self.update_views(out)
 
     def brush_stroke(self, world_coord):
@@ -263,11 +269,17 @@ class Mask3DEditorState:
         # After Rust modifies the array in-place, we update the viewer
         self.update_views(_mat)
 
-    def OnMaskChanged(self, index: int):
+    def OnMaskChanged(self, *args, **kwargs):
         cur_mask = slc.Slice().current_mask
         if cur_mask is not None:
-            self.mask_data = cur_mask.matrix.copy()
+            self.mask_data = cur_mask.matrix
+            self.base_mask_data = None
             self.has_cleared_for_crop = False
+
+    def OnSliceReloaded(self, *args, **kwargs):
+        cur_mask = slc.Slice().current_mask
+        if cur_mask is not None:
+            self.mask_data = cur_mask.matrix
 
     def update_views(self, _mat):
         # Notify the 2D views that the mask changed.
@@ -301,6 +313,6 @@ class Mask3DEditorState:
     def end_brush_stroke(self):
         cur_mask = slc.Slice().current_mask
         if cur_mask is not None:
-            cur_mask.save_history(0, "VOLUME", self.original_mask_data, self.mask_data)
+            cur_mask.save_history(0, "VOLUME", self.mask_data, self.original_mask_data)
             self.mask_data = cur_mask.matrix.copy()
             cur_mask.modified(all_volume=True)
