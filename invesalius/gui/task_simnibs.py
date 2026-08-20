@@ -69,6 +69,33 @@ TOPIC_UNSET_TARGET = "Unset target"
 _AXES_INV_TO_SIMNIBS = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
 
 
+def _matsimnibs_from_coord(coord):
+    """Turn an InVesalius coil pose [x, y, z, alpha, beta, gamma] into a matsimnibs matrix."""
+    position, orientation = imagedata_utils.convert_invesalius_to_world(
+        position=coord[:3],
+        orientation=coord[3:],
+    )
+    if position[0] is None:
+        return None
+
+    mat = tr.compose_matrix(angles=np.radians(orientation), translate=position)
+    mat[:3, :3] = mat[:3, :3] @ _AXES_INV_TO_SIMNIBS
+    return mat
+
+
+def _coil_markers() -> dict:
+    """The coil poses of the marker list, as {display name: marker}."""
+    from invesalius.data.markers.marker import MarkerType
+    from invesalius.navigation.markers import MarkersControl
+
+    poses = (MarkerType.COIL_TARGET, MarkerType.COIL_POSE)
+    return {
+        "{}: {}".format(marker.marker_id, marker.label or _("(unnamed)")): marker
+        for marker in MarkersControl().list
+        if marker.marker_type in poses and None not in marker.orientation
+    }
+
+
 def _find_charm() -> str | None:
     path = shutil.which("charm")
     if path:
@@ -147,13 +174,13 @@ def _label_info(present_labels: list) -> dict:
     return result
 
 
-class _SurfaceListPopup(wx.ComboPopup):
-    """The ticked list of surfaces shown when the dropdown opens."""
+class _CheckListPopup(wx.ComboPopup):
+    """The ticked list shown when the dropdown opens."""
 
-    def __init__(self, on_check, on_popup):
+    def __init__(self, on_check, on_refresh):
         wx.ComboPopup.__init__(self)
         self._on_check = on_check
-        self._on_popup = on_popup
+        self._on_refresh = on_refresh
         self.listbox = None
 
     def Create(self, parent):
@@ -164,13 +191,12 @@ class _SurfaceListPopup(wx.ComboPopup):
     def GetControl(self):
         return self.listbox
 
-    def OnPopup(self):
-        self._on_popup()
-
     def GetStringValue(self):
         return ", ".join(self.GetCheckedStrings())
 
     def GetAdjustedSize(self, min_width, pref_height, max_height):
+        # wx measures the popup before showing it
+        self._on_refresh()
         rows = max(self.listbox.GetCount() if self.listbox else 0, 1)
         return wx.Size(min_width, min(max_height, 8 + rows * 22))
 
@@ -182,9 +208,6 @@ class _SurfaceListPopup(wx.ComboPopup):
         if self.listbox is not None:
             self.listbox.Set(list(names))
 
-    def GetItems(self):
-        return list(self.listbox.GetStrings()) if self.listbox else []
-
     def GetCheckedStrings(self):
         return list(self.listbox.GetCheckedStrings()) if self.listbox else []
 
@@ -195,13 +218,14 @@ class _SurfaceListPopup(wx.ComboPopup):
         self.listbox.SetCheckedStrings([name for name in names if name in known])
 
 
-class SurfaceCheckCombo(wx.ComboCtrl):
-    """A surface dropdown where more than one surface can be ticked."""
+class CheckCombo(wx.ComboCtrl):
+    """A dropdown where more than one entry can be ticked."""
 
-    def __init__(self, parent, on_change, on_popup):
+    def __init__(self, parent, on_change, on_refresh, empty_label):
         wx.ComboCtrl.__init__(self, parent, style=wx.CB_READONLY)
         self._on_change = on_change
-        self._popup = _SurfaceListPopup(self._OnCheck, on_popup)
+        self._empty_label = empty_label
+        self._popup = _CheckListPopup(self._OnCheck, on_refresh)
         self.SetPopupControl(self._popup)
         self._ShowChecked()
 
@@ -211,17 +235,14 @@ class SurfaceCheckCombo(wx.ComboCtrl):
 
     def _ShowChecked(self):
         checked = self.GetChecked()
-        self.SetValue(", ".join(checked) if checked else _("(none — E-field mesh)"))
+        self.SetValue(", ".join(checked) if checked else self._empty_label)
 
-    def SetSurfaces(self, names):
+    def SetItems(self, names):
         """List `names`, keeping whichever of them were already ticked."""
         checked = [name for name in self.GetChecked() if name in names]
         self._popup.SetItems(names)
         self._popup.SetCheckedStrings(checked)
         self._ShowChecked()
-
-    def GetSurfaces(self):
-        return self._popup.GetItems()
 
     def GetChecked(self):
         return self._popup.GetCheckedStrings()
@@ -233,12 +254,6 @@ class SurfaceCheckCombo(wx.ComboCtrl):
 
 _SIM_OUT_PREFIX = "simnibs_simulation"
 _MAX_TARGET_NAME = 40
-# Files that only SimNIBS writes into an output folder.
-_SIM_ARTIFACT_PATTERNS = (
-    "simnibs_simulation*.mat",
-    "simnibs_simulation*.log",
-    "*_TMS_*.msh",
-)
 
 
 def _subject_id_from_m2m(m2m_path: str) -> str:
@@ -253,8 +268,12 @@ def _sanitize_for_folder(name: str, limit: int = _MAX_TARGET_NAME) -> str:
     return cleaned[:limit].rstrip("._-")
 
 
-def _derive_sim_output_dir(m2m_path: str, target_name: str = "") -> str:
-    """Default output folder for a given m2m folder and coil target."""
+def _coil_model_name(coil_path: str) -> str:
+    return os.path.splitext(os.path.basename(coil_path))[0]
+
+
+def _derive_sim_output_dir(m2m_path: str, target_name: str = "", coil_name: str = "") -> str:
+    """Default output folder for a given m2m folder, coil target and coil model."""
     if not m2m_path:
         return ""
     parent = os.path.dirname(os.path.normpath(m2m_path))
@@ -262,46 +281,8 @@ def _derive_sim_output_dir(m2m_path: str, target_name: str = "") -> str:
     subject = _subject_id_from_m2m(m2m_path)
     if subject:
         parts.append(subject)
-    target = _sanitize_for_folder(target_name)
-    if target:
-        parts.append(target)
+    parts += [part for part in map(_sanitize_for_folder, (target_name, coil_name)) if part]
     return os.path.join(parent, "_".join(parts))
-
-
-def _has_simulation_results(path: str) -> bool:
-    """True if SimNIBS would refuse to run in `path` because it already holds results."""
-    return bool(glob.glob(os.path.join(path, "simnibs_simulation*.mat")))
-
-
-def _is_simnibs_output_dir(path: str) -> bool:
-    """True if `path` holds files SimNIBS wrote, and is therefore safe to empty."""
-    return any(glob.glob(os.path.join(path, pattern)) for pattern in _SIM_ARTIFACT_PATTERNS)
-
-
-def _clear_output_dir(path: str) -> int:
-    """Delete everything inside `path`, keeping the folder itself. Returns entries removed."""
-    if not _is_simnibs_output_dir(path):
-        raise ValueError(f"{path} does not look like a SimNIBS output folder")
-    removed = 0
-    for name in os.listdir(path):
-        entry = os.path.join(path, name)
-        if os.path.isdir(entry) and not os.path.islink(entry):
-            shutil.rmtree(entry)
-        else:
-            os.unlink(entry)
-        removed += 1
-    return removed
-
-
-def _next_free_output_dir(path: str, limit: int = 100) -> str:
-    """Re-running needs a fresh folder."""
-    if not path or not _has_simulation_results(path):
-        return path
-    for n in range(2, limit + 1):
-        candidate = f"{path}_{n:03d}"
-        if not _has_simulation_results(candidate):
-            return candidate
-    return path
 
 
 class TaskPanel(wx.ScrolledWindow):
@@ -331,6 +312,11 @@ class InnerTaskPanel(wx.Panel):
         self._m2m_path = None
         self._matsimnibs = None
         self._running = None
+        # Coil poses of the marker list, as {display name: marker}.
+        self._pose_markers: dict = {}
+        # Runs still to be sent, one per ticked coil pose.
+        self._queue: list[dict] = []
+        self._run_number = 0
         # False once the user picks a simulation output folder by hand.
         self._sim_output_is_auto = True
         # Name of the active coil target, used to name the simulation folder.
@@ -502,27 +488,52 @@ class InnerTaskPanel(wx.Panel):
         sz_sim.Add(g2, 0, wx.EXPAND | wx.ALL, 2)
 
         self.chk_overwrite = wx.CheckBox(self, -1, _("Overwrite previous results"))
+        self.chk_overwrite.SetValue(True)
         self.chk_overwrite.SetToolTip(
             _(
-                "Off: a re-run goes to a new numbered folder (…_002, …_003),\n"
-                "keeping earlier results. On: the output folder is emptied first,\n"
-                "so each target keeps a single folder with its latest result.\n"
-                "SimNIBS refuses to run twice in the same folder, so one or the\n"
-                "other has to happen. You are asked to confirm before anything\n"
-                "is deleted."
+                "The output folder is named after the coil target and the coil\n"
+                "model, so changing either already gives a folder of its own.\n"
+                "This only decides what an exact repeat does.\n"
+                "On: the folder is emptied first, keeping the latest result only.\n"
+                "Off: the repeat runs beside it, in a folder stamped with the\n"
+                "time SimNIBS started it — the same stamp it puts on the .mat\n"
+                "and .log inside."
             )
         )
         sz_sim.Add(self.chk_overwrite, 0, wx.ALL, 2)
+
+        row_poses = wx.BoxSizer(wx.HORIZONTAL)
+        row_poses.Add(
+            wx.StaticText(self, -1, _("Coil poses:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+        )
+        self.combo_poses = CheckCombo(
+            self,
+            on_change=self.OnPoseSelect,
+            on_refresh=self._refresh_pose_dropdown,
+            empty_label=_("(none — pose below)"),
+        )
+        self.combo_poses.SetToolTip(
+            _(
+                "The coil targets and coil poses of the marker list, which is filled\n"
+                "by loading a marker file — navigation does not have to run.\n"
+                "Tick one to simulate it; tick several to run one simulation per pose,\n"
+                "each written to its own folder named after the marker.\n"
+                "With none ticked the pose below is used, from navigation or a file."
+            )
+        )
+        row_poses.Add(self.combo_poses, 1)
+        sz_sim.Add(row_poses, 0, wx.EXPAND | wx.ALL, 2)
 
         # matsimnibs display
         sz_sim.Add(wx.StaticText(self, -1, _("Coil pose (matsimnibs):")), 0, wx.LEFT | wx.TOP, 2)
         self.txt_mat = wx.TextCtrl(
             self,
             -1,
-            _("No pose — navigation must send a coil pose first"),
+            "",
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL,
             size=wx.Size(-1, 72),
         )
+        self._show_pose_source()
         sz_sim.Add(self.txt_mat, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 2)
 
         row_pose = wx.BoxSizer(wx.HORIZONTAL)
@@ -565,8 +576,11 @@ class InnerTaskPanel(wx.Panel):
         row_surf.Add(
             wx.StaticText(self, -1, _("Surface:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
         )
-        self.combo_surface = SurfaceCheckCombo(
-            self, on_change=self.OnSurfaceSelect, on_popup=self._refresh_surface_dropdown
+        self.combo_surface = CheckCombo(
+            self,
+            on_change=self.OnSurfaceSelect,
+            on_refresh=self._refresh_surface_dropdown,
+            empty_label=_("(none — E-field mesh)"),
         )
         self.combo_surface.SetToolTip(
             _(
@@ -721,7 +735,7 @@ class InnerTaskPanel(wx.Panel):
         m2m_path = m2m_path or self.txt_m2m.GetValue().strip()
         if not m2m_path:
             return
-        derived = _derive_sim_output_dir(m2m_path, self._target_name)
+        derived = _derive_sim_output_dir(m2m_path, self._target_name, self._coil_name())
         if derived:
             self._set_sim_output_dir(derived, auto=True)
 
@@ -860,14 +874,20 @@ class InnerTaskPanel(wx.Panel):
         if self.cmb_coil.FindString(display) == wx.NOT_FOUND:
             self.cmb_coil.Append(display)
         self.cmb_coil.SetValue(display)
+        self._autofill_sim_output_dir()
 
     def _selected_coil_path(self):
         return self._coil_paths.get(self.cmb_coil.GetValue(), "")
+
+    def _coil_name(self) -> str:
+        """The coil model the output folder is named after."""
+        return _coil_model_name(self._selected_coil_path())
 
     def OnCoilSelected(self, _evt):
         path = self._selected_coil_path()
         if path:
             self._save_path(_KEY_COIL_FILE, path)
+        self._autofill_sim_output_dir()
 
     def OnAddCoil(self, _evt):
         path = self._browse_file(
@@ -1066,17 +1086,69 @@ class InnerTaskPanel(wx.Panel):
         if coord is None or len(coord) < 6:
             return
 
-        position, orientation = imagedata_utils.convert_invesalius_to_world(
-            position=coord[:3],
-            orientation=coord[3:],
-        )
-        if position[0] is None:
+        mat = _matsimnibs_from_coord(coord)
+        if mat is None:
             return
 
-        mat = tr.compose_matrix(angles=np.radians(orientation), translate=position)
-        mat[:3, :3] = mat[:3, :3] @ _AXES_INV_TO_SIMNIBS
-
         self._matsimnibs = mat.tolist()
+
+    def _refresh_pose_dropdown(self, _evt=None) -> None:
+        """List the coil poses of the marker list, keeping whichever are ticked."""
+        self._pose_markers = _coil_markers()
+        self.combo_poses.SetItems(list(self._pose_markers))
+
+    def _checked_poses(self) -> list:
+        """The ticked markers, as (display name, marker)."""
+        return [
+            (name, self._pose_markers[name])
+            for name in self.combo_poses.GetChecked()
+            if name in self._pose_markers
+        ]
+
+    def OnPoseSelect(self) -> None:
+        """The ticked coil markers are the poses to simulate."""
+        poses = self._checked_poses()
+
+        if len(poses) == 1:
+            name, marker = poses[0]
+            mat = _matsimnibs_from_coord(marker.coordinate)
+            if mat is None:
+                self._warn_no_affine()
+                return
+            self._refresh_mat_display(mat)
+            self._set_target_name(marker.label or name)
+            self.lbl_sim.SetLabel(_("Coil pose from marker {}.").format(name))
+        elif poses:
+            self.txt_mat.SetValue(
+                _("{} coil poses ticked, simulated one run each:\n{}").format(
+                    len(poses), ", ".join(name for name, _marker in poses)
+                )
+            )
+            # Each run names its own folder after its marker.
+            self._set_target_name("")
+            self.lbl_sim.SetLabel(_("{} coil poses to simulate.").format(len(poses)))
+        else:
+            self._show_pose_source()
+
+    def _show_pose_source(self) -> None:
+        """Show the pose a run with no ticked marker would use."""
+        if self._matsimnibs is not None:
+            self._refresh_mat_display(np.array(self._matsimnibs))
+        else:
+            self.txt_mat.SetValue(
+                _("No pose — tick a coil marker above, or take one from navigation or a file")
+            )
+
+    def _warn_no_affine(self) -> None:
+        wx.MessageBox(
+            _(
+                "The project has no affine matrix, so a coil pose cannot be converted to "
+                "SimNIBS coordinates.\n\nOpen the SimNIBS-processed T1.nii.gz from the "
+                "m2m folder as the project image."
+            ),
+            _("SimNIBS"),
+            wx.ICON_WARNING,
+        )
 
     def OnLockPose(self, _evt):
         if self._matsimnibs is None:
@@ -1086,6 +1158,7 @@ class InnerTaskPanel(wx.Panel):
                 wx.ICON_WARNING,
             )
             return
+        self.combo_poses.SetChecked([])
         self._refresh_mat_display(np.array(self._matsimnibs))
 
     def _refresh_mat_display(self, mat=None):
@@ -1113,6 +1186,7 @@ class InnerTaskPanel(wx.Panel):
             )
             return
         self._matsimnibs = mat.tolist()
+        self.combo_poses.SetChecked([])
         self._refresh_mat_display(mat)
         stem = os.path.splitext(os.path.basename(path))[0]
         self._set_target_name(re.sub(r"^(coil_)?pose_", "", stem, flags=re.IGNORECASE))
@@ -1135,13 +1209,6 @@ class InnerTaskPanel(wx.Panel):
         out_dir = self.txt_sim_out.GetValue().strip()
         coil = self._selected_coil_path().strip()
 
-        if self.chk_overwrite.GetValue():
-            if not self._clear_previous_results(out_dir):
-                return
-        elif self._sim_output_is_auto:
-            out_dir = _next_free_output_dir(out_dir)
-            self._set_sim_output_dir(out_dir, auto=True)
-
         try:
             didt = float(self.txt_didt.GetValue())
         except ValueError:
@@ -1156,60 +1223,130 @@ class InnerTaskPanel(wx.Panel):
             )
             return
 
-        payload: dict = {
-            "m2m_dir": m2m_path,
-            "output_dir": out_dir,
-            "coil": coil,
-            "didt": didt,
-            "overwrite": self.chk_overwrite.GetValue(),
-        }
-        if self._matsimnibs is not None:
-            payload["matsimnibs"] = self._matsimnibs
+        runs = self._plan_runs(out_dir)
+        if not runs:
+            return
 
-        Publisher.sendMessage("SimNIBS: Run simulation", **payload)
+        overwrite = self.chk_overwrite.GetValue()
+        self._queue = [
+            {
+                "name": run["name"],
+                "m2m_dir": m2m_path,
+                "output_dir": run["output_dir"],
+                "coil": coil,
+                "didt": didt,
+                "overwrite": overwrite,
+                "matsimnibs": run["matsimnibs"],
+            }
+            for run in runs
+        ]
+        self._run_number = 0
+        self._start_next_run()
+
+    def _plan_runs(self, base_out_dir: str) -> list:
+        """One entry per coil pose to simulate, each with an output folder of its own."""
+        ticked = len(self.combo_poses.GetChecked())
+        self._refresh_pose_dropdown()
+        poses = self._checked_poses()
+        if len(poses) < ticked:
+            wx.MessageBox(
+                _("{} of the ticked coil poses are no longer in the marker list.").format(
+                    ticked - len(poses)
+                ),
+                _("SimNIBS"),
+                wx.ICON_WARNING,
+            )
+            if not poses:
+                return []
+
+        if poses:
+            runs = []
+            for name, marker in poses:
+                mat = _matsimnibs_from_coord(marker.coordinate)
+                if mat is None:
+                    self._warn_no_affine()
+                    return []
+                runs.append(
+                    {
+                        "name": marker.label or name,
+                        "marker_id": marker.marker_id,
+                        "matsimnibs": mat.tolist(),
+                    }
+                )
+        elif self._matsimnibs is not None:
+            runs = [{"name": self._target_name, "marker_id": None, "matsimnibs": self._matsimnibs}]
+        else:
+            wx.MessageBox(
+                _(
+                    "No coil pose to simulate.\n\nTick a coil marker, or take a pose from "
+                    "navigation or a coil pose file."
+                ),
+                _("No pose"),
+                wx.ICON_WARNING,
+            )
+            return []
+
+        batch = len(runs) > 1
+        assigned: set = set()
+        for run in runs:
+            path = self._output_dir_for(base_out_dir, run["name"], batch)
+            if path in assigned:
+                # Two markers whose labels sanitise the same way; their ids do not.
+                path = f"{path}_marker{run['marker_id']}"
+            assigned.add(path)
+            run["output_dir"] = path
+        return runs
+
+    def _output_dir_for(self, base: str, target_name: str, batch: bool) -> str:
+        """Where one run writes."""
+        if self._sim_output_is_auto:
+            m2m = self.txt_m2m.GetValue().strip()
+            return _derive_sim_output_dir(m2m, target_name, self._coil_name()) or base
+        if batch:
+            return os.path.join(base, _sanitize_for_folder(target_name) or _SIM_OUT_PREFIX)
+        return base
+
+    def _start_next_run(self) -> None:
+        """Send the first queued pose to the server."""
+        run = self._queue.pop(0)
+        self._run_number += 1
+        total = self._run_number + len(self._queue)
+
+        Publisher.sendMessage(
+            "SimNIBS: Run simulation",
+            m2m_dir=run["m2m_dir"],
+            output_dir=run["output_dir"],
+            coil=run["coil"],
+            didt=run["didt"],
+            overwrite=run["overwrite"],
+            matsimnibs=run["matsimnibs"],
+        )
 
         self._running = "sim"
         self.btn_run_sim.Enable(False)
         self.btn_cancel_sim.Enable(True)
         self.gauge_sim.SetValue(0)
-        self.lbl_sim.SetLabel(_("Sent to SimNIBS server…"))
-
-    def _clear_previous_results(self, out_dir: str) -> bool:
-        """Empty `out_dir` after confirmation."""
-        if not out_dir or not _is_simnibs_output_dir(out_dir):
-            return True
-
-        count = len(os.listdir(out_dir))
-        msg = _(
-            "Delete the {} file(s) already in the simulation output folder?\n\n"
-            "  {}\n\n"
-            "The results of the previous run are lost. Uncheck "
-            '"Overwrite previous results" to keep them and write this run to a '
-            "new numbered folder instead."
-        ).format(count, out_dir)
-        if (
-            wx.MessageBox(msg, _("Overwrite previous results"), wx.YES_NO | wx.ICON_WARNING)
-            != wx.YES
-        ):
-            return False
-
-        try:
-            _clear_output_dir(out_dir)
-        except Exception as exc:  # noqa: BLE001 - report to the user
-            wx.MessageBox(
-                _("Could not empty the output folder:\n{}\n\n{}").format(out_dir, exc),
-                _("Overwrite failed"),
-                wx.ICON_ERROR,
+        if total > 1:
+            self.lbl_sim.SetLabel(
+                _("Pose {}/{} ({}) sent to SimNIBS server…").format(
+                    self._run_number, total, run["name"] or _("no name")
+                )
             )
-            return False
-        return True
+        else:
+            self.lbl_sim.SetLabel(_("Sent to SimNIBS server…"))
 
     def OnCancelSimulation(self, _evt):
         Publisher.sendMessage("SimNIBS: Cancel simulation")
+        pending = len(self._queue)
+        self._queue = []
         self._running = None
         self.btn_run_sim.Enable(True)
         self.btn_cancel_sim.Enable(False)
-        self.lbl_sim.SetLabel(_("Cancel requested."))
+        self.lbl_sim.SetLabel(
+            _("Cancel requested, {} queued pose(s) dropped.").format(pending)
+            if pending
+            else _("Cancel requested.")
+        )
 
     def _on_efield_loaded(self, result_msh):
         converting = self._running == "convert"
@@ -1229,6 +1366,9 @@ class InnerTaskPanel(wx.Panel):
             log.warning(
                 "SimNIBS returned %s, which is not a surface the viewer can read", result_msh
             )
+
+        if not converting and self._queue:
+            self._start_next_run()
 
     def _OnPulse(self, _evt):
         self.gauge_efield.Pulse()
@@ -1256,6 +1396,10 @@ class InnerTaskPanel(wx.Panel):
         converting = self._running == "convert"
         self._running = None
         self._StopPulse()
+        pending = len(self._queue)
+        self._queue = []
+        if pending:
+            message = _("{}\n\n{} queued coil pose(s) were not simulated.").format(message, pending)
         if converting:
             self.gauge_efield.SetValue(0)
             self.lbl_efield.SetLabel(_("Conversion failed."))
@@ -1276,8 +1420,6 @@ class InnerTaskPanel(wx.Panel):
         self._show_masks_for(selected)
 
         if not self._efield_loaded:
-            # Still the surface picker with no field loaded; an empty tick list would
-            # mean hiding everything, which is not what clearing it asks for.
             if selected:
                 Publisher.sendMessage(
                     TOPIC_SHOW_SURFACES,
@@ -1300,8 +1442,6 @@ class InnerTaskPanel(wx.Panel):
 
     def OnMaxDistance(self, evt) -> None:
         evt.Skip()
-        # Fires on every arrow click and whenever the field loses focus, and each
-        # repaint resamples every target, so only act on a real change.
         distance = self.spin_distance.GetValue()
         if not self._efield_loaded or distance == self._painted_distance:
             return
@@ -1319,7 +1459,7 @@ class InnerTaskPanel(wx.Panel):
         """List every surface in the project, keeping whichever are ticked."""
         import invesalius.project as prj
 
-        self.combo_surface.SetSurfaces([str(s.name) for s in prj.Project().surface_dict.values()])
+        self.combo_surface.SetItems([str(s.name) for s in prj.Project().surface_dict.values()])
 
     def _surface_indexes(self, names) -> list:
         import invesalius.project as prj
