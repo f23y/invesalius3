@@ -64,6 +64,8 @@ TOPIC_CHARM_DONE = "Charm done"
 TOPIC_COIL_POSE = "From Neuronavigation: Send coil pose"
 TOPIC_SET_TARGET = "Set target"
 TOPIC_UNSET_TARGET = "Unset target"
+# The colour series the real-time E-field uses.
+_VTK_COLORMAP = "BluePurple (E-field)"
 
 # Columns = SimNIBS coil axes in InVesalius ones: y is +x (away from handle), z is -z (into head).
 _AXES_INV_TO_SIMNIBS = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
@@ -637,7 +639,7 @@ class InnerTaskPanel(wx.Panel):
         row_cmap.Add(
             wx.StaticText(self, -1, _("Colormap:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
         )
-        cmap_choices = list(const.MEP_COLORMAP_DEFINITIONS.keys())
+        cmap_choices = [_VTK_COLORMAP] + list(const.MEP_COLORMAP_DEFINITIONS.keys())
         self.combo_cmap = wx.ComboBox(
             self,
             -1,
@@ -645,8 +647,12 @@ class InnerTaskPanel(wx.Panel):
             choices=cmap_choices,
             style=wx.CB_DROPDOWN | wx.CB_READONLY,
         )
-        self.combo_cmap.SetStringSelection(
-            "Viridis" if "Viridis" in cmap_choices else cmap_choices[0]
+        self.combo_cmap.SetStringSelection(_VTK_COLORMAP)
+        self.combo_cmap.SetToolTip(
+            _(
+                "Colours used for the field magnitude. The first entry is the same "
+                "colour series the real-time E-field uses."
+            )
         )
         self.combo_cmap.Bind(wx.EVT_COMBOBOX, self.OnColormap)
         row_cmap.Add(self.combo_cmap, 1)
