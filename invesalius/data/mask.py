@@ -49,6 +49,10 @@ class EditionHistoryNode:
         np.save(self.filename, array)
         print("Saving history", self.index, self.orientation, self.filename, self.clean)
 
+    @property
+    def action_name(self):
+        return f"{self.orientation.capitalize()} Slice {self.index + 1}"
+
     def commit_history(self, mvolume):
         array = np.load(self.filename)
         if self.orientation == "AXIAL":
@@ -95,6 +99,14 @@ class DeltaHistoryNode:
 
         self.fd = None
         self.filename = None
+
+    @property
+    def action_name(self):
+        if self.tool_id == "POLYGON":
+            return "3D Polygon Cut"
+        elif self.tool_id == "BRUSH":
+            return "3D Brush Edit"
+        return "3D Volume Edit"
 
     def serialize_to_disk(self):
         """Compresses and writes delta arrays to a temporary file for crash recovery / memory spillover."""
@@ -154,9 +166,18 @@ class EditionHistory:
         Publisher.sendMessage("Enable undo", value=False)
         Publisher.sendMessage("Enable redo", value=False)
 
-    def new_node(self, index, orientation, array, p_array, clean):
+    def notify_history_change(self):
+        items = []
+        for i, node in enumerate(self.history):
+            name = getattr(node, "action_name", f"Edit {i + 1}")
+            items.append((i, name))
+        Publisher.sendMessage("Update history stack", items=items, current_index=self.index)
+
+    def new_node(self, index, orientation, array, p_array, clean=False, tool_id="VOLUME"):
         if orientation == "VOLUME":
-            node = DeltaHistoryNode(index, orientation, p_array, array, clean=clean)
+            node = DeltaHistoryNode(
+                index, orientation, p_array, array, tool_id=tool_id, clean=clean
+            )
             self.add(node)
         else:
             # Saving the previous state, used to undo/redo correctly for 2D slices.
@@ -179,6 +200,19 @@ class EditionHistory:
         print("INDEX", self.index, len(self.history), self.history)
         Publisher.sendMessage("Enable undo", value=True)
         Publisher.sendMessage("Enable redo", value=False)
+        self.notify_history_change()
+
+    def jump_to(self, target_index, mvolume, actual_slices=None):
+        if target_index == self.index or target_index < -1 or target_index >= len(self.history):
+            return
+
+        while self.index > target_index and self.index >= 0:
+            self.undo(mvolume, actual_slices)
+
+        while self.index < target_index and self.index < len(self.history) - 1:
+            self.redo(mvolume, actual_slices)
+
+        self.notify_history_change()
 
     def undo(self, mvolume, actual_slices=None):
         h = self.history
@@ -353,8 +387,8 @@ class Mask:
             self.volume.set_colour(colour)
             Publisher.sendMessage("Render volume viewer")
 
-    def save_history(self, index, orientation, array, p_array, clean=False):
-        self.history.new_node(index, orientation, array, p_array, clean)
+    def save_history(self, index, orientation, array, p_array, clean=False, tool_id="VOLUME"):
+        self.history.new_node(index, orientation, array, p_array, clean, tool_id)
 
     def undo_history(self, actual_slices):
         import invesalius.data.slice_ as slc
@@ -368,6 +402,7 @@ class Mask:
 
         Publisher.sendMessage("Update slice viewer")
         Publisher.sendMessage("Reload actual slice")
+        self.history.notify_history_change()
 
         # Marking the project as changed
         session = ses.Session()
@@ -385,8 +420,25 @@ class Mask:
 
         Publisher.sendMessage("Update slice viewer")
         Publisher.sendMessage("Reload actual slice")
+        self.history.notify_history_change()
 
         # Marking the project as changed
+        session = ses.Session()
+        session.ChangeProject()
+
+    def jump_to_history(self, target_index, actual_slices=None):
+        import invesalius.data.slice_ as slc
+
+        self.history.jump_to(target_index, self.matrix, actual_slices)
+        self.modified_time = time.monotonic()
+
+        slc.Slice().discard_all_buffers()
+        if self.volume is not None and ses.Session().mask_3d_preview:
+            self._update_imagedata(update_volume_viewer=True)
+
+        Publisher.sendMessage("Update slice viewer")
+        Publisher.sendMessage("Reload actual slice")
+
         session = ses.Session()
         session.ChangeProject()
 

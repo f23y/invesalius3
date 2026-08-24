@@ -83,3 +83,33 @@ def test_edition_history_volume_deltas():
     history.redo(matrix)
     assert np.array_equal(matrix, orig_2)
     assert history.index == 0
+
+
+def test_edition_history_jump_to():
+    history = EditionHistory(size=10)
+    matrix = np.zeros((30, 30, 30), dtype=np.uint8)
+
+    # Initial state (State -1)
+    state_init = matrix.copy()
+
+    # Stroke 1: State -1 -> State 0
+    matrix[5:10, 5:10, 5:10] = 255
+    state_0 = matrix.copy()
+    history.new_node(0, "VOLUME", state_0, state_init, clean=False, tool_id="BRUSH")
+
+    # Stroke 2: State 0 -> State 1
+    matrix[15:20, 15:20, 15:20] = 255
+    state_1 = matrix.copy()
+    history.new_node(0, "VOLUME", state_1, state_0, clean=False, tool_id="POLYGON")
+
+    assert history.index == 1
+
+    # Jump directly back to Initial State (index -1)
+    history.jump_to(-1, matrix)
+    assert history.index == -1
+    assert np.array_equal(matrix, state_init)
+
+    # Jump forward directly to State 1 (index 1)
+    history.jump_to(1, matrix)
+    assert history.index == 1
+    assert np.array_equal(matrix, state_1)

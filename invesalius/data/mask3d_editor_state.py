@@ -226,7 +226,7 @@ class Mask3DEditorState:
         self.mask_data[1:, 1:, 1:] = out
         cur_mask = slc.Slice().current_mask
         if cur_mask is not None:
-            cur_mask.save_history(0, "VOLUME", self.mask_data, orig_mask)
+            cur_mask.save_history(0, "VOLUME", self.mask_data, orig_mask, tool_id="POLYGON")
         self.update_views(out)
 
     def brush_stroke(self, world_coord):
@@ -313,6 +313,8 @@ class Mask3DEditorState:
     def end_brush_stroke(self):
         cur_mask = slc.Slice().current_mask
         if cur_mask is not None:
-            cur_mask.save_history(0, "VOLUME", self.mask_data, self.original_mask_data)
+            cur_mask.save_history(
+                0, "VOLUME", self.mask_data, self.original_mask_data, tool_id="BRUSH"
+            )
             self.mask_data = cur_mask.matrix.copy()
             cur_mask.modified(all_volume=True)
